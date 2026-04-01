@@ -1,0 +1,5 @@
+vendor/bundle/
+.bundle/
+tmp/jobs/*/
+tmp/jobs/.gitkeep
+*.log

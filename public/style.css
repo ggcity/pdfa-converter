@@ -1,0 +1,67 @@
+/* PDF/A Converter — minimal custom styles */
+
+body {
+  font-size: 0.95rem;
+}
+
+/* Drop zone */
+.drop-zone {
+  background-color: #f8f9fa;
+  border: 2px dashed #dee2e6 !important;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+  user-select: none;
+}
+
+.drop-zone:hover,
+.drop-zone:focus {
+  border-color: #0d6efd !important;
+  background-color: #eef3ff;
+  outline: none;
+}
+
+.drop-zone--active {
+  border-color: #0d6efd !important;
+  background-color: #dbe6fd;
+}
+
+.drop-zone-icon {
+  font-size: 2rem;
+  line-height: 1;
+}
+
+/* Progress bar text */
+.progress-bar {
+  font-size: 0.78rem;
+  font-weight: 600;
+  transition: width 0.4s ease;
+}
+
+/* File list item remove button */
+.remove-btn {
+  font-size: 0.75rem;
+  line-height: 1;
+  text-decoration: none;
+}
+.remove-btn:hover {
+  opacity: 0.7;
+}
+
+/* Status list icons */
+#status-list li {
+  border-bottom: 1px solid #f0f0f0;
+  padding: 0.3rem 0;
+}
+#status-list li:last-child {
+  border-bottom: none;
+}
+
+/* Countdown timer */
+#expiry-countdown {
+  font-size: 0.85rem;
+}
+
+/* Section heading rule */
+hr {
+  opacity: 0.15;
+}

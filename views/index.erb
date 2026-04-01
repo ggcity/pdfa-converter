@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF/A Converter</title>
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+    integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+    crossorigin="anonymous"
+  />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="bg-light">
+
+<div class="container py-5" style="max-width: 720px;">
+
+  <!-- Header -->
+  <div class="mb-4">
+    <h1 class="h3 fw-semibold mb-1">Garden Grove PDF/A Converter</h1>
+  </div>
+
+  <!-- Upload form -->
+  <div id="upload-section">
+
+    <!-- Drop zone -->
+    <div
+      id="drop-zone"
+      class="drop-zone border rounded p-5 text-center mb-3"
+      role="button"
+      tabindex="0"
+      aria-label="File upload drop zone"
+    >
+      <div class="drop-zone-icon mb-2">📄</div>
+      <div class="fw-medium">Drag &amp; drop PDF files or a ZIP file here</div>
+      <div class="text-muted small mt-1">— or click to browse —</div>
+      <div class="text-muted small mt-2">Accepts: <code>.pdf</code>, <code>.zip</code></div>
+      <input
+        type="file"
+        id="file-input"
+        accept=".pdf,.zip"
+        multiple
+        class="d-none"
+        aria-hidden="true"
+      />
+    </div>
+
+    <!-- Client-side file validation warnings -->
+    <div id="file-warnings" class="alert alert-warning d-none" role="alert"></div>
+
+    <!-- Selected file list -->
+    <div id="file-list-section" class="d-none mb-3">
+      <div class="card">
+        <div class="card-body py-2 px-3">
+          <div class="small fw-semibold text-muted mb-2">Selected files:</div>
+          <ul id="file-list" class="list-unstyled mb-0 small"></ul>
+        </div>
+      </div>
+    </div>
+
+    <button id="convert-btn" class="btn btn-primary" disabled>
+      Convert to PDF/A
+    </button>
+
+  </div><!-- /upload-section -->
+
+  <hr class="my-4" />
+
+  <!-- Progress section (hidden until job starts) -->
+  <div id="progress-section" class="d-none">
+
+    <h2 class="h6 fw-semibold text-uppercase text-muted mb-3">Progress</h2>
+
+    <!-- Progress bar -->
+    <div class="progress mb-2" style="height: 22px;" role="progressbar" aria-label="Conversion progress">
+      <div
+        id="progress-bar"
+        class="progress-bar progress-bar-striped progress-bar-animated"
+        style="width: 0%"
+      ></div>
+    </div>
+    <div id="progress-label" class="small text-muted mb-3">Preparing…</div>
+
+    <!-- Per-file status list -->
+    <ul id="status-list" class="list-unstyled small mb-0"></ul>
+
+  </div><!-- /progress-section -->
+
+  <!-- Completion section (hidden until job finishes) -->
+  <div id="complete-section" class="d-none">
+    <hr class="my-4" />
+    <h2 class="h6 fw-semibold text-uppercase text-muted mb-3">Complete</h2>
+
+    <div id="error-summary" class="alert alert-danger d-none mb-3" role="alert"></div>
+
+    <div id="download-area" class="d-none">
+      <a id="download-btn" href="#" class="btn btn-success me-3">
+        Download Converted Files
+      </a>
+      <span id="expiry-countdown" class="text-muted small align-middle"></span>
+      <div id="expiry-expired" class="alert alert-warning mt-3 d-none">
+        This file has expired and is no longer available.
+      </div>
+    </div>
+
+    <button id="convert-another-btn" class="btn btn-outline-secondary mt-3">
+      Convert another batch
+    </button>
+  </div><!-- /complete-section -->
+
+</div><!-- /container -->
+
+<script>
+/* =========================================================================
+   State
+   ========================================================================= */
+let selectedFiles   = [];
+let currentJobId    = null;
+let pollInterval    = null;
+let countdownTimer  = null;
+let expiresAt       = null;
+
+/* =========================================================================
+   Elements
+   ========================================================================= */
+const dropZone        = document.getElementById("drop-zone");
+const fileInput       = document.getElementById("file-input");
+const fileListSection = document.getElementById("file-list-section");
+const fileListEl      = document.getElementById("file-list");
+const fileWarnings    = document.getElementById("file-warnings");
+const convertBtn      = document.getElementById("convert-btn");
+const uploadSection   = document.getElementById("upload-section");
+const progressSection = document.getElementById("progress-section");
+const progressBar     = document.getElementById("progress-bar");
+const progressLabel   = document.getElementById("progress-label");
+const statusList      = document.getElementById("status-list");
+const completeSection = document.getElementById("complete-section");
+const errorSummary    = document.getElementById("error-summary");
+const downloadArea    = document.getElementById("download-area");
+const downloadBtn     = document.getElementById("download-btn");
+const expiryCountdown = document.getElementById("expiry-countdown");
+const expiryExpired   = document.getElementById("expiry-expired");
+const convertAnotherBtn = document.getElementById("convert-another-btn");
+
+/* =========================================================================
+   Drag & Drop / File Input
+   ========================================================================= */
+dropZone.addEventListener("click", () => fileInput.click());
+dropZone.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
+});
+
+dropZone.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  dropZone.classList.add("drop-zone--active");
+});
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drop-zone--active"));
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropZone.classList.remove("drop-zone--active");
+  handleFiles(Array.from(e.dataTransfer.files));
+});
+
+fileInput.addEventListener("change", () => {
+  handleFiles(Array.from(fileInput.files));
+  fileInput.value = "";
+});
+
+function handleFiles(files) {
+  const valid   = [];
+  const invalid = [];
+
+  files.forEach((f) => {
+    const ext = f.name.split(".").pop().toLowerCase();
+    if (ext === "pdf" || ext === "zip") {
+      valid.push(f);
+    } else {
+      invalid.push(f.name);
+    }
+  });
+
+  // Merge (avoid duplicates by name)
+  valid.forEach((f) => {
+    if (!selectedFiles.find((sf) => sf.name === f.name && sf.size === f.size)) {
+      selectedFiles.push(f);
+    }
+  });
+
+  if (invalid.length > 0) {
+    fileWarnings.textContent =
+      "Unsupported file(s) ignored: " + invalid.join(", ") + ". Only .pdf and .zip are accepted.";
+    fileWarnings.classList.remove("d-none");
+  } else {
+    fileWarnings.classList.add("d-none");
+  }
+
+  renderFileList();
+}
+
+function renderFileList() {
+  fileListEl.innerHTML = "";
+  if (selectedFiles.length === 0) {
+    fileListSection.classList.add("d-none");
+    convertBtn.disabled = true;
+    return;
+  }
+  fileListSection.classList.remove("d-none");
+  convertBtn.disabled = false;
+
+  selectedFiles.forEach((f, idx) => {
+    const li = document.createElement("li");
+    li.className = "d-flex justify-content-between align-items-center py-1 border-bottom";
+    li.innerHTML =
+      `<span>☑ <span class="fw-medium">${escHtml(f.name)}</span></span>` +
+      `<span class="text-muted">${formatBytes(f.size)}` +
+      ` <button type="button" class="btn btn-sm btn-link text-danger p-0 ms-2 remove-btn" data-idx="${idx}" aria-label="Remove">✕</button></span>`;
+    fileListEl.appendChild(li);
+  });
+
+  document.querySelectorAll(".remove-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const i = parseInt(e.currentTarget.dataset.idx, 10);
+      selectedFiles.splice(i, 1);
+      renderFileList();
+    });
+  });
+}
+
+/* =========================================================================
+   Upload & Convert
+   ========================================================================= */
+convertBtn.addEventListener("click", startConversion);
+
+async function startConversion() {
+  if (selectedFiles.length === 0) return;
+
+  convertBtn.disabled = true;
+  dropZone.style.pointerEvents = "none";
+
+  const formData = new FormData();
+  selectedFiles.forEach((f) => formData.append("files[]", f, f.name));
+
+  progressSection.classList.remove("d-none");
+  progressBar.style.width = "0%";
+  progressLabel.textContent = "Uploading…";
+  statusList.innerHTML = "";
+
+  let data;
+  try {
+    const res = await fetch("/upload", { method: "POST", body: formData });
+    data = await res.json();
+    if (!res.ok) {
+      showFatalError(data.error || "Upload failed.");
+      resetUploadUI();
+      return;
+    }
+  } catch (err) {
+    showFatalError("Network error: " + err.message);
+    resetUploadUI();
+    return;
+  }
+
+  currentJobId = data.job_id;
+  startPolling(currentJobId);
+}
+
+/* =========================================================================
+   Polling
+   ========================================================================= */
+function startPolling(jobId) {
+  pollInterval = setInterval(() => pollStatus(jobId), 2000);
+  pollStatus(jobId); // immediate first call
+}
+
+async function pollStatus(jobId) {
+  let data;
+  try {
+    const res = await fetch(`/status/${jobId}`);
+    if (!res.ok) { stopPolling(); return; }
+    data = await res.json();
+  } catch { return; }
+
+  updateProgressUI(data);
+
+  const done = data.status === "complete" || data.status === "failed";
+  if (done) {
+    stopPolling();
+    showCompletion(data);
+  }
+}
+
+function stopPolling() {
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+}
+
+/* =========================================================================
+   Progress UI
+   ========================================================================= */
+function updateProgressUI(job) {
+  const total     = job.total_files || 1;
+  const completed = job.completed_files || 0;
+  const pct       = Math.round((completed / total) * 100);
+
+  progressBar.style.width = pct + "%";
+  progressBar.textContent = pct + "%";
+
+  if (job.current_file) {
+    progressLabel.textContent = `Processing: ${job.current_file}  (${completed} / ${total} files)`;
+  } else {
+    progressLabel.textContent = `${completed} / ${total} files`;
+  }
+
+  // Per-file status list
+  if (job.files && job.files.length > 0) {
+    statusList.innerHTML = "";
+    job.files.forEach((f) => {
+      const li = document.createElement("li");
+      li.className = "py-1";
+      let icon, cls;
+      switch (f.status) {
+        case "done":       icon = "✓"; cls = "text-success"; break;
+        case "processing": icon = "⟳"; cls = "text-primary"; break;
+        case "failed":     icon = "✗"; cls = "text-danger";  break;
+        case "rejected":   icon = "⚠"; cls = "text-warning"; break;
+        default:           icon = "·"; cls = "text-muted";
+      }
+      let label;
+      if (f.status === "done") {
+        label = "converted";
+        if (f.pdfa_validation) {
+          if (f.pdfa_validation.result === "pass") {
+            const profile = f.pdfa_validation.profile ? `PDF/A-${escHtml(f.pdfa_validation.profile)}` : "PDF/A";
+            label += ` <span class="text-success">· ✓ ${profile}</span>`;
+          } else {
+            label += ` <span class="text-warning">· ⚠ PDF/A validation failed</span>`;
+          }
+        }
+      } else if (f.status === "processing") {
+        label = "processing…";
+      } else if (f.status === "failed") {
+        label = `failed${f.error ? ": " + escHtml(f.error) : ""}`;
+      } else if (f.status === "rejected") {
+        label = `rejected${f.error ? ": " + escHtml(f.error) : ""}`;
+      } else {
+        label = "queued";
+      }
+      li.innerHTML = `<span class="${cls}">${icon} ${escHtml(f.name)}</span> <span class="text-muted">— ${label}</span>`;
+      statusList.appendChild(li);
+    });
+  }
+}
+
+/* =========================================================================
+   Completion UI
+   ========================================================================= */
+function showCompletion(job) {
+  completeSection.classList.remove("d-none");
+  progressBar.classList.remove("progress-bar-animated", "progress-bar-striped");
+
+  if (job.status === "failed") {
+    progressBar.classList.add("bg-danger");
+    progressBar.style.width = "100%";
+    errorSummary.textContent = "All files failed to convert. Please check the files and try again.";
+    errorSummary.classList.remove("d-none");
+    downloadArea.classList.add("d-none");
+    return;
+  }
+
+  progressBar.classList.add("bg-success");
+  progressBar.style.width = "100%";
+
+  const failedCount = job.failed_files || 0;
+  if (failedCount > 0) {
+    errorSummary.textContent =
+      `${failedCount} file(s) failed to convert. Successfully converted files are available for download.`;
+    errorSummary.classList.remove("d-none");
+  }
+
+  downloadBtn.href = `/download/${job.job_id}`;
+  downloadBtn.textContent = "Download Converted Files";
+  downloadArea.classList.remove("d-none");
+
+  if (job.expires_at) {
+    expiresAt = new Date(job.expires_at);
+    startCountdown();
+  }
+}
+
+function showFatalError(msg) {
+  completeSection.classList.remove("d-none");
+  errorSummary.textContent = msg;
+  errorSummary.classList.remove("d-none");
+  downloadArea.classList.add("d-none");
+}
+
+/* =========================================================================
+   Expiry Countdown
+   ========================================================================= */
+function startCountdown() {
+  tickCountdown();
+  countdownTimer = setInterval(tickCountdown, 1000);
+}
+
+function tickCountdown() {
+  if (!expiresAt) return;
+  const remaining = expiresAt - new Date();
+  if (remaining <= 0) {
+    clearInterval(countdownTimer);
+    expiryCountdown.textContent = "";
+    downloadBtn.classList.add("disabled");
+    downloadBtn.setAttribute("aria-disabled", "true");
+    expiryExpired.classList.remove("d-none");
+    return;
+  }
+  const totalSec = Math.floor(remaining / 1000);
+  const mins     = Math.floor(totalSec / 60);
+  const secs     = totalSec % 60;
+  expiryCountdown.textContent =
+    `⏱ File available for: ${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+/* =========================================================================
+   Convert Another
+   ========================================================================= */
+convertAnotherBtn.addEventListener("click", () => {
+  stopPolling();
+  clearInterval(countdownTimer);
+  currentJobId = null;
+  expiresAt    = null;
+  selectedFiles = [];
+  renderFileList();
+  progressSection.classList.add("d-none");
+  completeSection.classList.add("d-none");
+  errorSummary.classList.add("d-none");
+  downloadArea.classList.add("d-none");
+  expiryExpired.classList.add("d-none");
+  progressBar.style.width = "0%";
+  progressBar.textContent = "";
+  progressBar.className = "progress-bar progress-bar-striped progress-bar-animated";
+  statusList.innerHTML = "";
+  resetUploadUI();
+});
+
+function resetUploadUI() {
+  convertBtn.disabled = selectedFiles.length === 0;
+  dropZone.style.pointerEvents = "";
+}
+
+/* =========================================================================
+   Utilities
+   ========================================================================= */
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024)       return bytes + " B";
+  if (bytes < 1048576)    return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / 1048576).toFixed(1) + " MB";
+}
+</script>
+</body>
+</html>
