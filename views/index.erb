@@ -10,7 +10,7 @@
     integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
     crossorigin="anonymous"
   />
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="<%= request.script_name %>/style.css" />
 </head>
 <body class="bg-light">
 
@@ -112,6 +112,9 @@
 </div><!-- /container -->
 
 <script>
+/* Base path — set by Rack SCRIPT_NAME so the app works at any mount point */
+const BASE_PATH = "<%= request.script_name %>";
+
 /* =========================================================================
    State
    ========================================================================= */
@@ -248,7 +251,7 @@ async function startConversion() {
 
   let data;
   try {
-    const res = await fetch("/upload", { method: "POST", body: formData });
+    const res = await fetch(`${BASE_PATH}/upload`, { method: "POST", body: formData });
     data = await res.json();
     if (!res.ok) {
       showFatalError(data.error || "Upload failed.");
@@ -276,7 +279,7 @@ function startPolling(jobId) {
 async function pollStatus(jobId) {
   let data;
   try {
-    const res = await fetch(`/status/${jobId}`);
+    const res = await fetch(`${BASE_PATH}/status/${jobId}`);
     if (!res.ok) { stopPolling(); return; }
     data = await res.json();
   } catch { return; }
@@ -377,7 +380,7 @@ function showCompletion(job) {
     errorSummary.classList.remove("d-none");
   }
 
-  downloadBtn.href = `/download/${job.job_id}`;
+  downloadBtn.href = `${BASE_PATH}/download/${job.job_id}`;
   downloadBtn.textContent = "Download Converted Files";
   downloadArea.classList.remove("d-none");
 
