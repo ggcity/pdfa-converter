@@ -116,7 +116,11 @@ end
 # OCRmyPDF
 # ---------------------------------------------------------------------------
 
-OCRMYPDF_CMD = "ocrmypdf"
+OCRMYPDF_CMD = if ENV["RACK_ENV"] == "production"
+  "/var/www/rails/pdfa-converter/.venv/bin/ocrmypdf"
+else
+  "ocrmypdf"
+end
 
 OCRMYPDF_FLAGS = %w[
   --output-type pdfa-2
