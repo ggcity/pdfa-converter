@@ -197,6 +197,21 @@ def process_job(job_id)
     output_path = File.join(out_dir, filename)
     log_path    = File.join(log_dir, "#{filename}.log")
 
+    # Skip conversion if the file is already PDF/A-2b conformant
+    pre_check = run_verapdf(input_path, log_path)
+    if pre_check && pre_check["result"] == "pass" && pre_check["profile"] == "2b"
+      FileUtils.cp(input_path, output_path)
+      data  = read_status(job_id)
+      entry = data["files"].find { |f| f["name"] == filename }
+      entry["status"]          = "done"
+      entry["error"]           = nil
+      entry["skipped"]         = true
+      entry["pdfa_validation"] = pre_check
+      data["completed_files"] += 1
+      write_status(job_id, data)
+      next
+    end
+
     exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path)
 
     # Read fresh copy, update result

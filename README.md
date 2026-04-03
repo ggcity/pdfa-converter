@@ -2,6 +2,8 @@
 
 A Ruby Sinatra web application that wraps [OCRmyPDF](https://ocrmypdf.readthedocs.io/) v17+ to perform batch PDF → PDF/A-2b conversion. Upload one or more PDFs (or a ZIP archive of PDFs), convert them to the archival PDF/A-2b format, and download the results.
 
+Files that are **already PDF/A-2b conformant** are detected before conversion and passed through unchanged — skipping OCRmyPDF entirely for those files.
+
 ---
 
 ## System Dependencies
@@ -16,9 +18,18 @@ pip install ocrmypdf>=17.0
 pip install pypdfium2
 ```
 
-### verapdf (for speculative PDF/A conversion)
+### verapdf (optional, via Podman)
 
-Download and install from https://verapdf.org/home/#download or via your package manager. Make sure `verapdf` is on your `PATH`.
+Used for two purposes:
+
+1. **Pre-conversion check** — before running OCRmyPDF, verapdf inspects the input file. If it is already PDF/A-2b conformant the file is passed through unchanged and OCRmyPDF is skipped.
+2. **Post-conversion validation** — after a successful conversion, verapdf verifies that the output meets PDF/A-2b requirements. The result is included in the job status response.
+
+verapdf runs via the `verapdf/cli` Podman image — no local installation required. If Podman is not available (or the image is not pulled), both checks are silently skipped and conversion proceeds normally.
+
+```bash
+podman pull verapdf/cli
+```
 
 ### Ghostscript
 
@@ -106,20 +117,22 @@ This removes job directories older than 60 minutes, running every 10 minutes. Fi
 
 ```
 ocrmypdf \
-  --output-type auto \
+  --output-type pdfa-2 \
   --rasterizer auto \
   --skip-text \
   --optimize 1 \
   --pdfa-image-compression lossless \
+  --color-conversion-strategy RGB \
   --jobs 1 \
   input.pdf output.pdf
 ```
 
-- `--output-type auto` — speculative pikepdf+verapdf PDF/A conversion; Ghostscript fallback only when needed
-- `--rasterizer auto` — uses pypdfium2 when available
+- `--output-type pdfa-2` — targets PDF/A-2b output via Ghostscript
+- `--rasterizer auto` — uses pypdfium2 when available, falls back to pdftoppm
 - `--skip-text` — preserves existing text layers; skips pages that already have extractable text
 - `--optimize 1` — lossless optimizations only
-- `--pdfa-image-compression lossless` — prevents lossy transcoding during Ghostscript step
+- `--pdfa-image-compression lossless` — prevents lossy transcoding during the Ghostscript step
+- `--color-conversion-strategy RGB` — normalises colour spaces to RGB for PDF/A compliance
 - `--jobs 1` — per-file parallelism (multiple files are processed sequentially per job)
 
 ---
