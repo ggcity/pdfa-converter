@@ -3,7 +3,7 @@
    Family design language (see gg-toolbox PDF MERGGER): navy-deep header
    bar, condensed uppercase, hard-offset shadows, pixel accents.
    World: archival paper, verdigris patina, cast bronze, sealing wax.
-   (--navy* / --flame-* names kept for family markup compatibility —
+   (--navy* / --flame-* names kept for family markup compatibility;
    they carry the vault palette: --flame-yellow is verdigris,
    --flame-orange is wax, --gold is bronze.)
    ──────────────────────────────────────────────────────────────── */
@@ -94,7 +94,7 @@ body {
   transition: background 0.2s, color 0.2s;
 }
 
-/* Legacy show/hide helper — the page script toggles this class */
+/* Legacy show/hide helper: the page script toggles this class */
 .d-none { display: none !important; }
 
 .sr-only {
@@ -113,7 +113,7 @@ body {
 .gold { color: var(--gold); }
 [data-theme="dark"] .gold, .app-header .gold { color: #C9985E; }
 
-/* ── HEADER — same bar as the rest of the family ── */
+/* ── HEADER: same bar as the rest of the family ── */
 .app-header {
   background: var(--navy-deep);
   background-image:
@@ -139,7 +139,7 @@ body {
   white-space: nowrap;
 }
 
-/* BACK TO TOOLBOX — bare pixel arrow hugging the top-left corner */
+/* BACK TO TOOLBOX: bare pixel arrow hugging the top-left corner */
 .back-btn {
   display: inline-flex; align-items: center; justify-content: center;
   width: 36px; height: 36px;
@@ -209,7 +209,7 @@ body {
 }
 .brand-email-tooltip-body { font-size: 12.5px; color: var(--text-navy); line-height: 1.45; }
 
-/* THEME TOGGLE — pixel light switch */
+/* THEME TOGGLE: pixel light switch */
 .theme-toggle {
   display: inline-flex; align-items: center;
   cursor: pointer;
@@ -254,7 +254,7 @@ body {
 
 .stack { display: flex; flex-direction: column; gap: 18px; }
 
-/* HERO — rides up over the header bar */
+/* HERO: rides up over the header bar */
 .hero {
   margin-top: -20px;
   position: relative;
@@ -293,7 +293,7 @@ body {
 
 .pixel { font-family: 'Press Start 2P', monospace; }
 
-/* ── DROP ZONE — a ledger page ── */
+/* ── DROP ZONE: a ledger page ── */
 .drop-zone {
   background-color: var(--ice);
   background-image:

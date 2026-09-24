@@ -31,7 +31,7 @@
 
 <a href="#main" class="skip-link">Skip to content</a>
 
-<!-- HEADER — family bar -->
+<!-- HEADER: family bar -->
 <header class="app-header" role="banner">
   <div class="header-left">
     <a class="back-btn" href="https://toolbox.ggcity.org/" aria-label="Back to the GG IT Toolbox">
@@ -45,7 +45,7 @@
       </svg>
     </a>
     <div class="brand-email-wrap">
-      <button type="button" class="brand-email-btn" aria-label="Help and feedback — contact the IT Department">
+      <button type="button" class="brand-email-btn" aria-label="Help and feedback: contact the IT Department">
         <svg viewBox="0 0 16 12" aria-hidden="true">
           <rect x="0" y="0" width="16" height="12" fill="currentColor"/>
           <rect x="1" y="1" width="14" height="10" fill="var(--navy-deep)"/>
@@ -109,7 +109,7 @@
 
 <main class="vault" id="main">
 
-  <!-- HERO — rides up over the header bar -->
+  <!-- HERO: rides up over the header bar -->
   <div class="hero" id="hero">
     <h1 id="hero-title">Built to last</h1>
     <p id="hero-sub">Converts PDFs to PDF/A, the archival format for permanent City records. Every record is checked against the standard after conversion.</p>
@@ -238,7 +238,7 @@
 </main>
 
 <script>
-/* Base path — set by Rack SCRIPT_NAME so the app works at any mount point */
+/* Base path: set by Rack SCRIPT_NAME so the app works at any mount point */
 const BASE_PATH = "<%= request.script_name %>";
 
 /* =========================================================================
@@ -455,8 +455,8 @@ async function pollStatus(jobId) {
   let res, data;
   try {
     res = await fetch(`${BASE_PATH}/status/${jobId}`, { cache: "no-store" });
-  } catch { return; }            // transient network blip — try again next tick
-  if (res.status >= 500) return; // server hiccup — keep polling
+  } catch { return; }            // transient network blip: try again next tick
+  if (res.status >= 500) return; // server hiccup: keep polling
   if (!res.ok) {
     stopPolling();
     if (jobCompleted) showVaultClosed();
@@ -522,7 +522,7 @@ function recordBadge(f) {
 function plainError(f) {
   const raw = f.error || "";
   if (f.exit_code === 8 || /encrypt|password/i.test(raw)) {
-    return "Password-protected — remove the password and try again.";
+    return "Password-protected. Remove the password and try again.";
   }
   if (/unsupported file type/i.test(raw)) return "Only .pdf and .zip can be preserved";
   if (/zip extraction failed/i.test(raw)) return "ZIP could not be opened";
@@ -532,7 +532,7 @@ function plainError(f) {
   if (f.exit_code === 10 || /conversion to PDF\/A did not succeed/i.test(raw)) {
     return f.forced_image
       ? "Could not be made archival (PDF/A), even as page images"
-      : "Could not be made archival (PDF/A) — turn on “Force archival for difficult files” and try again";
+      : "Could not be made archival (PDF/A). Something inside this PDF blocks the archival format";
   }
   return shortRaw(raw) || "Could not be converted";
 }
@@ -660,7 +660,7 @@ function showCompletion(job) {
   const forced = files.filter((f) => f.status === "done" && f.forced_image);
   forced.forEach((f) => addAttention(
     f.name,
-    "Preserved as page images — text was re-read by OCR; links and form fields no longer work",
+    "Preserved as page images. Text was re-read by OCR; links and form fields no longer work",
     true
   ));
   if (fail.length + warn.length + forced.length > 0) show(attentionSection); else hide(attentionSection);
@@ -683,7 +683,7 @@ function addAttention(name, reason, isWarn) {
   attentionList.appendChild(li);
 }
 
-// Check the vault is still open before navigating — a closed vault swaps in the S4 card
+// Check the vault is still open before navigating: a closed vault swaps in the S4 card
 downloadBtn.addEventListener("click", async (e) => {
   if (!currentJobId) return;
   e.preventDefault();
@@ -693,7 +693,7 @@ downloadBtn.addEventListener("click", async (e) => {
     const res = await fetch(`${BASE_PATH}/status/${currentJobId}`, { cache: "no-store" });
     const data = res.ok ? await res.json() : null;
     if (!data || data.vault_closed || !data.download_ready) { showVaultClosed(); return; }
-  } catch { /* network blip — let the download itself report */ }
+  } catch { /* network blip: let the download itself report */ }
   window.location.href = href;
 });
 
@@ -718,7 +718,7 @@ const DEAD_ENDS = {
              <rect x="20" y="19" width="20" height="2" fill="#B0814A"/>
            </svg>`,
     title: "The vault is closed",
-    text: "These converted files were deleted from the server. Your originals were never changed — convert them again if you still need them.",
+    text: "These converted files were deleted from the server. Your originals were never changed. Convert them again if you still need them.",
     button: ["plain-btn plain-btn--xs", "Preserve another batch"],
   },
   network: {
@@ -728,7 +728,7 @@ const DEAD_ENDS = {
              <rect x="28" y="12" width="2" height="18" fill="#8E3226"/>
            </svg>`,
     title: "Didn't reach the vault",
-    text: "The upload stopped before conversion started. Your file list is still here — try again.",
+    text: "The upload stopped before conversion started. Your file list is still here. Try again.",
     button: ["press-btn press-btn--xs", "Try again"],
   },
 };
@@ -744,14 +744,6 @@ function showDeadEnd(kind, detail, files) {
         `<span class="attention-reason">${escHtml(plainError(f))}</span></li>`).join("") + `</ul>`
     : "";
 
-  // Files that only failed the archival step can be retried as page images
-  const canForce = kind === "failed" && selectedFiles.length > 0 &&
-    failedFiles.some((f) => f.exit_code === 10 && !f.forced_image);
-  const force = canForce
-    ? `<div class="force-explain">${forceExplain.innerHTML}</div>` +
-      `<button type="button" class="press-btn press-btn--xs" id="dead-end-force">Try again with Force archival</button>`
-    : "";
-
   deadEnd.classList.toggle("dead-end--wide", failedFiles.length > 0);
   deadEnd.innerHTML =
     `<div class="dead-end-body">${d.icon}` +
@@ -759,18 +751,10 @@ function showDeadEnd(kind, detail, files) {
     `<div class="dead-end-text">${failedFiles.length ? "None of the files could be converted:" : d.text}</div>` +
     list +
     (detail ? `<div class="dead-end-detail">${escHtml(detail)}</div>` : "") +
-    force +
     `<button type="button" class="${d.button[0]}" id="dead-end-btn">${d.button[1]}</button></div>`;
   show(deadEnd);
   show(completeSection);
   document.getElementById("dead-end-btn").addEventListener("click", kind === "network" ? startConversion : resetAll);
-  if (canForce) {
-    document.getElementById("dead-end-force").addEventListener("click", () => {
-      forceImage.checked = true;
-      show(forceExplain);
-      startConversion();
-    });
-  }
 }
 
 function showVaultClosed() {
@@ -855,7 +839,7 @@ function resetUploadUI() {
 }
 
 /* =========================================================================
-   Theme (shared family behavior — first paint handled in <head>)
+   Theme (shared family behavior: first paint handled in <head>)
    ========================================================================= */
 (function initTheme() {
   const btn  = document.getElementById("themeToggle");

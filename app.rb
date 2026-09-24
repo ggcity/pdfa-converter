@@ -18,7 +18,7 @@ JOB_TTL_SECONDS  = 3600       # vault stays open 1 hour after the job completes
 BOOT_CLEANUP_AGE = 6 * 3600   # delete on boot if older than 6 hours
 
 # Production (Passenger) appends to logs/app.log; everywhere else logs to stdout.
-# No built-in rotation — it isn't safe across Passenger processes; use logrotate.
+# No built-in rotation: it isn't safe across Passenger processes; use logrotate.
 LOGGER = if ENV["RACK_ENV"] == "production"
   FileUtils.mkdir_p(LOG_DIR)
   log_file = File.open(File.join(LOG_DIR, "app.log"), "a")
@@ -28,7 +28,7 @@ else
   Logger.new($stdout)
 end
 
-# Job IDs are download credentials — only ever log a prefix.
+# Job IDs are download credentials: only ever log a prefix.
 def short_id(job_id)
   "#{job_id.to_s[0, 8]}…"
 end
@@ -55,7 +55,7 @@ configure do
 
   FileUtils.mkdir_p(JOBS_DIR)
 
-  # Boot cleanup — remove stale job directories left by crashes / missed cron
+  # Boot cleanup: remove stale job directories left by crashes / missed cron
   Dir.glob(File.join(JOBS_DIR, "*")).each do |dir|
     next unless File.directory?(dir)
     age = Time.now - File.mtime(dir)
@@ -190,7 +190,7 @@ OCRMYPDF_FLAGS = %w[
 ].freeze
 
 # ---------------------------------------------------------------------------
-# Log helpers — make app.log say *why*, not just "failed"
+# Log helpers: make app.log say *why*, not just "failed"
 # ---------------------------------------------------------------------------
 
 # ocrmypdf.ExitCode names, so the log reads "10 pdfa_conversion_failed".
@@ -225,7 +225,7 @@ def human_size(bytes)
   format("%.1f MB", bytes / (1024.0 * 1024))
 end
 
-# "PDF 1.7, 2.1 MB" from the header bytes — cheap and useful when triaging.
+# "PDF 1.7, 2.1 MB" from the header bytes: cheap and useful when triaging.
 def describe_pdf(path)
   header  = File.open(path, "rb") { |f| f.read(8) }.to_s
   version = header[/%PDF-(\d\.\d)/, 1]
@@ -251,7 +251,57 @@ end
 OCRMYPDF_FORCE_FLAGS = OCRMYPDF_FLAGS.map { |f| f == "--skip-text" ? "--force-ocr" : f }.freeze
 EXIT_PDFA_FAILED     = 10   # output is a valid PDF, but not PDF/A
 
+# The Python that runs ocrmypdf (the venv's in production), so pikepdf is available.
+OCRMYPDF_PYTHON = if ENV["RACK_ENV"] == "production"
+  File.join(File.dirname(OCRMYPDF_CMD), "python")
+else
+  "python3"
+end
+
+# Ghostscript 9.54 (RHEL 9) can't carry non-ASCII DOCINFO text (e.g. an en dash
+# in /Title) into PDF/A XMP: it discards DOCINFO and the PDF/A marker with it,
+# so ocrmypdf exits 10 "No PDF/A metadata in XMP". This writes a copy whose
+# DOCINFO text is plain ASCII; page content is untouched. Prints one line per
+# changed field, and writes nothing when there is nothing to change.
+PLAIN_DOCINFO_PY = <<~'PY'
+  import sys, unicodedata, pikepdf
+  src, dst = sys.argv[1], sys.argv[2]
+  MAP = {"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2212": "-",
+         "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"',
+         "\u2026": "...", "\u2022": "*", "\u00a0": " ", "\u00a9": "(C)", "\u00ae": "(R)", "\u2122": "(TM)"}
+  def plain(s):
+      s = "".join(MAP.get(c, c) for c in s)
+      return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+  changed = []
+  with pikepdf.open(src) as pdf:
+      for key in list(pdf.docinfo.keys()):
+          value = pdf.docinfo[key]
+          if isinstance(value, pikepdf.String):
+              text = str(value)
+              if any(ord(c) > 127 for c in text):
+                  pdf.docinfo[key] = plain(text)
+                  changed.append(f"{key}: {text!r} -> {plain(text)!r}")
+      if changed:
+          pdf.save(dst)
+  print("\n".join(changed))
+PY
+
+# Returns [path_of_plain_copy_or_nil, "description of changes"].
+def plain_docinfo_copy(input_path, work_dir)
+  FileUtils.mkdir_p(work_dir)
+  dst = File.join(work_dir, File.basename(input_path))
+  out, err, st = Open3.capture3(OCRMYPDF_PYTHON, "-c", PLAIN_DOCINFO_PY, input_path, dst)
+  return [nil, "could not rewrite metadata: #{(err.strip.lines.last || "exit #{st.exitstatus}").strip}"] unless st.success?
+  return [nil, "no non-ASCII document info to simplify"] unless File.exist?(dst)
+  [dst, out.strip]
+rescue SystemCallError => e
+  [nil, "could not run #{OCRMYPDF_PYTHON}: #{e.message}"]
+end
+
 # Record which tool versions this worker uses (in the background: --version is slow).
+# Ghostscript does the PDF/A step (--pdfa-image-compression rules out OCRmyPDF's
+# pikepdf-only route), so its version and path matter most when dev and prod differ.
+# Passenger's PATH can differ from a login shell's, hence the resolved paths.
 Thread.new do
   version = lambda do |*cmd|
     out, st = Open3.capture2e(*cmd)
@@ -259,9 +309,20 @@ Thread.new do
   rescue SystemCallError
     "not found"
   end
-  LOGGER.info "[boot] pid #{Process.pid}, RACK_ENV=#{ENV["RACK_ENV"] || "development"}, ruby #{RUBY_VERSION}, " \
-              "ocrmypdf #{version.call(OCRMYPDF_CMD, "--version")} (#{OCRMYPDF_CMD}), " \
-              "ghostscript #{version.call("gs", "--version")}, #{version.call("tesseract", "--version")}"
+  which = lambda do |cmd|
+    return cmd if cmd.include?("/")
+    dir = ENV["PATH"].to_s.split(File::PATH_SEPARATOR).find { |d| File.executable?(File.join(d, cmd)) }
+    dir ? File.join(dir, cmd) : "not on PATH"
+  end
+  # The Python that runs ocrmypdf: the venv's in production, python3 otherwise
+  pylibs = version.call(OCRMYPDF_PYTHON, "-c",
+    "import sys, pikepdf; print('python', sys.version.split()[0], 'pikepdf', pikepdf.__version__, 'qpdf', pikepdf.__libqpdf_version__)")
+  LOGGER.info "[boot] pid #{Process.pid}, RACK_ENV=#{ENV["RACK_ENV"] || "development"}, ruby #{RUBY_VERSION}\n" \
+              "    ocrmypdf    #{version.call(OCRMYPDF_CMD, "--version")} (#{which.call(OCRMYPDF_CMD)})\n" \
+              "    #{pylibs}\n" \
+              "    ghostscript #{version.call("gs", "--version")} (#{which.call("gs")})\n" \
+              "    #{version.call("tesseract", "--version")} (#{which.call("tesseract")})\n" \
+              "    PATH=#{ENV["PATH"]}"
 end
 
 def run_ocrmypdf(input_path, output_path, log_path, force: false)
@@ -297,12 +358,12 @@ def run_verapdf(output_path, log_path)
     profile = first_line.split[2]   # e.g. "2b"
     { "result" => "pass", "profile" => profile }
   elsif first_line.empty?
-    nil   # podman/image unavailable — skip silently
+    nil   # podman/image unavailable: skip silently
   else
     { "result" => "fail", "details" => first_line }
   end
 rescue Errno::ENOENT
-  nil   # podman not on PATH — skip silently
+  nil   # podman not on PATH: skip silently
 end
 
 # ---------------------------------------------------------------------------
@@ -355,14 +416,32 @@ def process_job(job_id)
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     LOGGER.info "#{tag}: running ocrmypdf #{OCRMYPDF_FLAGS.join(" ")}"
     exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path)
-    forced = false
+    forced          = false
+    docinfo_changes = nil
+    retry_input     = input_path
+
+    # Retry 1 (automatic, content untouched): plain-ASCII document info
     if exit_code == EXIT_PDFA_FAILED
-      if initial["force_image"]
-        LOGGER.warn "#{tag}: normal conversion ended #{exit_label(exit_code)}; ocrmypdf said:\n#{stderr_digest(stderr)}"
-        LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{OCRMYPDF_FORCE_FLAGS.join(" ")}"
-        exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, force: true)
-        forced = true
+      LOGGER.warn "#{tag}: normal conversion ended #{exit_label(exit_code)}; ocrmypdf said:\n#{stderr_digest(stderr)}"
+      plain_path, note = plain_docinfo_copy(input_path, File.join(job_dir(job_id), "work"))
+      if plain_path
+        LOGGER.info "#{tag}: retrying with plain-ASCII document info:\n#{note.lines.map { |l| "    | #{l.rstrip}" }.join("\n")}"
+        exit_code, stderr = run_ocrmypdf(plain_path, output_path, log_path)
+        docinfo_changes = note
+        retry_input     = plain_path
+        if exit_code == EXIT_PDFA_FAILED
+          LOGGER.warn "#{tag}: plain-document-info retry also ended #{exit_label(exit_code)}; ocrmypdf said:\n#{stderr_digest(stderr)}"
+        end
+      else
+        LOGGER.info "#{tag}: no plain-document-info retry (#{note})"
       end
+    end
+
+    # Retry 2 (last resort, only when the user opted in): pages as images
+    if exit_code == EXIT_PDFA_FAILED && initial["force_image"]
+      LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{OCRMYPDF_FORCE_FLAGS.join(" ")}"
+      exit_code, stderr = run_ocrmypdf(retry_input, output_path, log_path, force: true)
+      forced = true
     end
     elapsed = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(1)
 
@@ -370,14 +449,18 @@ def process_job(job_id)
     data  = read_status(job_id)
     entry = data["files"].find { |f| f["name"] == filename }
 
-    # Exit code 6 = "already has OCR text" — treated as success with --skip-text
+    # Exit code 6 = "already has OCR text": treated as success with --skip-text
     if exit_code == 0 || exit_code == 6
       entry["status"]          = "done"
       entry["error"]           = nil
       entry["forced_image"]    = forced
+      entry["docinfo_simplified"] = !docinfo_changes.nil?
       entry["pdfa_validation"] = run_verapdf(output_path, log_path)
       data["completed_files"] += 1
-      how = forced ? "forced as page images" : "normal"
+      how = if forced then "forced as page images"
+            elsif docinfo_changes then "normal, with plain-ASCII document info"
+            else "normal"
+            end
       LOGGER.info "#{tag}: converted in #{elapsed}s (#{how}, exit #{exit_label(exit_code)}), " \
                   "output #{describe_pdf(output_path)}, verapdf post-check #{verapdf_label(entry["pdfa_validation"])}"
     else
@@ -386,13 +469,14 @@ def process_job(job_id)
       entry["error"]        = short_err
       entry["exit_code"]    = exit_code
       entry["forced_image"] = forced
+      entry["docinfo_simplified"] = !docinfo_changes.nil?
       data["completed_files"] += 1
       data["failed_files"]    += 1
       FileUtils.rm_f(output_path)   # a non-archival leftover must not end up in the download
       context = if forced
         "even after the forced page-image retry"
       elsif exit_code == EXIT_PDFA_FAILED
-        "force archival was off, so no page-image retry"
+        "#{docinfo_changes ? "also after the plain-document-info retry; " : ""}force archival was off, so no page-image retry"
       else
         "no retry for this exit code"
       end
@@ -444,7 +528,7 @@ def process_job(job_id)
   end
   total_s  = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - job_started).round(1)
   download = data["download_filename"] ? ", download #{data["download_filename"]} (#{human_size(data["download_size"])})" : ""
-  LOGGER.info "[job #{short_id(job_id)}] Finished in #{total_s}s: #{data["status"]} — " \
+  LOGGER.info "[job #{short_id(job_id)}] Finished in #{total_s}s: #{data["status"]}, " \
               "#{done_files.size} done, #{data["failed_files"]} failed#{download}"
 rescue => e
   LOGGER.error "[job-error] #{short_id(job_id)} #{e.class}: #{e.message}\n  #{Array(e.backtrace).first(5).join("\n  ")}"

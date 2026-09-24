@@ -175,11 +175,16 @@ ocrmypdf \
 - `--color-conversion-strategy RGB` — normalises colour spaces to RGB for PDF/A compliance
 - `--jobs 1` — per-file parallelism (multiple files are processed sequentially per job)
 
-### Force archival (opt-in)
+### When PDF/A conversion fails (exit code 10)
 
-Some PDFs contain things Ghostscript can't make PDF/A-compliant. OCRmyPDF still writes a valid PDF, but exits with code 10 ("conversion to PDF/A did not succeed"), and those files fail by default.
+Some PDFs contain things Ghostscript can't make PDF/A-compliant. OCRmyPDF still writes a valid PDF, but exits with code 10 ("conversion to PDF/A did not succeed"). The app then tries two things, in order.
 
-If the user ticks **Force archival for difficult files** before uploading, each file that fails this way is retried once with `--force-ocr` instead of `--skip-text`. That rebuilds every page as an image with an OCR text layer, which passes PDF/A far more often. The cost:
+**1. Plain document info (automatic).** Ghostscript 9.54, the version RHEL 9 ships in production, can't copy non-ASCII document info into PDF/A metadata. An en dash in the title is enough. It discards the info and the PDF/A marker with it, so OCRmyPDF reports "No PDF/A metadata in XMP". Ghostscript 10.x doesn't have this problem, which is why such files work in dev but not in prod.
+- On exit 10, the app writes a copy whose title, author, subject and keywords use plain ASCII (`–` becomes `-`, `é` becomes `e`, curly quotes become straight ones) and retries normally.
+- Page content is untouched, and the changes are logged in `logs/app.log`.
+- The real fix is a newer Ghostscript on the server. Build 10.05.x into `/usr/local` and make sure Passenger's PATH puts `/usr/local/bin` first. Avoid 10.6.0 and later, which OCRmyPDF warns have JPEG encoding bugs. The boot line in `app.log` shows which `gs` each worker uses.
+
+**2. Force archival (opt-in, last resort).** If the user ticked **Force archival for difficult files** before uploading, a file that still fails is retried once with `--force-ocr` instead of `--skip-text`. That rebuilds every page as an image with an OCR text layer, which passes PDF/A far more often. The cost:
 - The file is bigger.
 - The text is re-read by OCR and can contain mistakes.
 - Links, bookmarks and form fields stop working.
