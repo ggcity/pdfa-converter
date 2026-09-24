@@ -612,7 +612,7 @@ function showCompletion(job) {
 
   if (job.status === "failed") {
     errorSummary.textContent = "Nothing was preserved.";
-    showDeadEnd("failed");
+    showDeadEnd("failed", null, job.files || []);
     return;
   }
 
@@ -733,17 +733,44 @@ const DEAD_ENDS = {
   },
 };
 
-function showDeadEnd(kind, detail) {
+function showDeadEnd(kind, detail, files) {
   const d = DEAD_ENDS[kind];
+
+  // For a failed job, say why each file failed instead of only "Nothing was preserved"
+  const failedFiles = (files || []).filter((f) => classify(f) === "fail");
+  const list = failedFiles.length
+    ? `<ul class="dead-end-list">` + failedFiles.map((f) =>
+        `<li><span class="row-name">${escHtml(f.name)}</span>` +
+        `<span class="attention-reason">${escHtml(plainError(f))}</span></li>`).join("") + `</ul>`
+    : "";
+
+  // Files that only failed the archival step can be retried as page images
+  const canForce = kind === "failed" && selectedFiles.length > 0 &&
+    failedFiles.some((f) => f.exit_code === 10 && !f.forced_image);
+  const force = canForce
+    ? `<div class="force-explain">${forceExplain.innerHTML}</div>` +
+      `<button type="button" class="press-btn press-btn--xs" id="dead-end-force">Try again with Force archival</button>`
+    : "";
+
+  deadEnd.classList.toggle("dead-end--wide", failedFiles.length > 0);
   deadEnd.innerHTML =
     `<div class="dead-end-body">${d.icon}` +
     `<div class="dead-end-title">${d.title}</div>` +
-    `<div class="dead-end-text">${d.text}</div>` +
+    `<div class="dead-end-text">${failedFiles.length ? "None of the files could be converted:" : d.text}</div>` +
+    list +
     (detail ? `<div class="dead-end-detail">${escHtml(detail)}</div>` : "") +
+    force +
     `<button type="button" class="${d.button[0]}" id="dead-end-btn">${d.button[1]}</button></div>`;
   show(deadEnd);
   show(completeSection);
   document.getElementById("dead-end-btn").addEventListener("click", kind === "network" ? startConversion : resetAll);
+  if (canForce) {
+    document.getElementById("dead-end-force").addEventListener("click", () => {
+      forceImage.checked = true;
+      show(forceExplain);
+      startConversion();
+    });
+  }
 }
 
 function showVaultClosed() {

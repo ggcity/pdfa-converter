@@ -49,7 +49,7 @@ When the job finishes: if exactly one file converted, it is served as-is. If mor
 
 **verapdf is optional.** `run_verapdf` runs `podman run verapdf/cli`. It returns `nil` when podman or the image is missing, and callers must treat `nil` as "skip", not as a failure. The UI shows `nil` as "Converted · not checked" and counts it under "Check failed".
 
-**Logging:** everything goes through `LOGGER`. In production that's `logs/app.log`, appended with sync and no in-process rotation because of multiple Passenger processes. Everywhere else it's stdout. `Rack::CommonLogger` sends request lines to the same logger. Log job IDs only through `short_id`.
+**Logging:** everything goes through `LOGGER`. In production that's `logs/app.log`, appended with sync and no in-process rotation because of multiple Passenger processes. Everywhere else it's stdout. `RedactingCommonLogger` sends request lines to the same logger, shortening job IDs and skipping successful `/status` polls. Log job IDs only through `short_id`. Failures log the named exit code (`exit_label`), the diagnostic lines of OCRmyPDF's stderr (`stderr_digest`), and where the full per-file log is (`job_log_hint`). Each worker also logs its tool versions at boot.
 
 **Environment-dependent paths:**
 - With `RACK_ENV=production`, `OCRMYPDF_CMD` points at `/var/www/rails/pdfa-converter/.venv/bin/ocrmypdf`. In dev it is plain `ocrmypdf` on PATH.

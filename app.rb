@@ -39,10 +39,12 @@ class RedactingCommonLogger < Rack::CommonLogger
 
   private
 
-  def log(env, *args)
+  def log(env, status, *args)
     path = env[Rack::PATH_INFO].to_s
+    # The page polls /status every 2s; successful polls are noise. Failures still log.
+    return if env[Rack::REQUEST_METHOD] == "GET" && path.start_with?("/status/") && status.to_i < 400
     env  = env.merge(Rack::PATH_INFO => path.gsub(UUID_RE) { |id| short_id(id) }) if path.match?(UUID_RE)
-    super(env, *args)
+    super(env, status, *args)
   end
 end
 
@@ -187,11 +189,80 @@ OCRMYPDF_FLAGS = %w[
   --jobs 1
 ].freeze
 
+# ---------------------------------------------------------------------------
+# Log helpers — make app.log say *why*, not just "failed"
+# ---------------------------------------------------------------------------
+
+# ocrmypdf.ExitCode names, so the log reads "10 pdfa_conversion_failed".
+OCRMYPDF_EXIT_NAMES = {
+  0 => "ok", 1 => "bad_args", 2 => "input_file", 3 => "missing_dependency",
+  4 => "invalid_output_pdf", 5 => "file_access_error", 6 => "already_done_ocr",
+  7 => "child_process_error", 8 => "encrypted_pdf", 9 => "invalid_config",
+  10 => "pdfa_conversion_failed", 15 => "other_error", 130 => "ctrl_c"
+}.freeze
+
+def exit_label(code)
+  "#{code.inspect} #{OCRMYPDF_EXIT_NAMES.fetch(code, "unknown")}"
+end
+
+# Lines of ocrmypdf stderr worth reading: warnings, errors, Ghostscript and
+# PDF/A messages, plus the final few lines. Per-page progress is dropped.
+STDERR_DIAG_RE = %r{warn|error|fail|ghostscript|cannot|could not|unable|invalid|
+                    not\s(?:supported|allowed|a\s)|pdf/a|xmp|font|transparen|
+                    encrypt|signature|colou?r|icc|annotation|embedded}xi
+
+def stderr_digest(stderr, max_lines: 25)
+  lines  = stderr.to_s.lines.map(&:rstrip).reject(&:empty?)
+  picked = (lines.select { |l| l.match?(STDERR_DIAG_RE) } + lines.last(5)).uniq.last(max_lines)
+  return "    | (no output)" if picked.empty?
+  picked.map { |l| "    | #{l}" }.join("\n")
+end
+
+def human_size(bytes)
+  return "?" unless bytes
+  return "#{bytes} B" if bytes < 1024
+  return format("%.1f KB", bytes / 1024.0) if bytes < 1024 * 1024
+  format("%.1f MB", bytes / (1024.0 * 1024))
+end
+
+# "PDF 1.7, 2.1 MB" from the header bytes — cheap and useful when triaging.
+def describe_pdf(path)
+  header  = File.open(path, "rb") { |f| f.read(8) }.to_s
+  version = header[/%PDF-(\d\.\d)/, 1]
+  "PDF #{version || "?"}, #{human_size(File.size?(path))}"
+rescue SystemCallError
+  "unreadable"
+end
+
+# Where the full ocrmypdf/verapdf output lives, without the full job ID.
+def job_log_hint(job_id, filename)
+  "full output: tmp/jobs/#{job_id.to_s[0, 8]}*/logs/#{filename}.log"
+end
+
+def verapdf_label(result)
+  return "unavailable (podman/image missing or file unreadable)" unless result
+  return "pass (PDF/A-#{result["profile"]})" if result["result"] == "pass"
+  "fail: #{result["details"]}"
+end
+
 # "Force archival" retry: rasterize every page and OCR it instead of keeping the
 # existing text layer. Only used, when the user opts in, for files whose normal
 # conversion ends in EXIT_PDFA_FAILED. (--force-ocr and --skip-text are exclusive.)
 OCRMYPDF_FORCE_FLAGS = OCRMYPDF_FLAGS.map { |f| f == "--skip-text" ? "--force-ocr" : f }.freeze
 EXIT_PDFA_FAILED     = 10   # output is a valid PDF, but not PDF/A
+
+# Record which tool versions this worker uses (in the background: --version is slow).
+Thread.new do
+  version = lambda do |*cmd|
+    out, st = Open3.capture2e(*cmd)
+    st.success? ? out.strip.lines.first.to_s.strip : "error (#{out.strip.lines.last.to_s.strip})"
+  rescue SystemCallError
+    "not found"
+  end
+  LOGGER.info "[boot] pid #{Process.pid}, RACK_ENV=#{ENV["RACK_ENV"] || "development"}, ruby #{RUBY_VERSION}, " \
+              "ocrmypdf #{version.call(OCRMYPDF_CMD, "--version")} (#{OCRMYPDF_CMD}), " \
+              "ghostscript #{version.call("gs", "--version")}, #{version.call("tesseract", "--version")}"
+end
 
 def run_ocrmypdf(input_path, output_path, log_path, force: false)
   flags = force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS
@@ -244,6 +315,7 @@ def process_job(job_id)
   log_dir = File.join(job_dir(job_id), "logs")
   FileUtils.mkdir_p([out_dir, log_dir])
 
+  job_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   initial = read_status(job_id)
   # Only process files that are queued (not rejected)
   filenames = initial["files"].reject { |f| f["status"] == "rejected" }.map { |f| f["name"] }
@@ -260,8 +332,12 @@ def process_job(job_id)
     output_path = File.join(out_dir, filename)
     log_path    = File.join(log_dir, "#{filename}.log")
 
+    tag = "[job #{short_id(job_id)}] #{filename}"
+    LOGGER.info "#{tag}: starting (#{describe_pdf(input_path)})"
+
     # Skip conversion if the file is already PDF/A-2b conformant
     pre_check = run_verapdf(input_path, log_path)
+    LOGGER.info "#{tag}: verapdf pre-check #{verapdf_label(pre_check)}"
     if pre_check && pre_check["result"] == "pass" && pre_check["profile"] == "2b"
       FileUtils.cp(input_path, output_path)
       data  = read_status(job_id)
@@ -272,17 +348,21 @@ def process_job(job_id)
       entry["pdfa_validation"] = pre_check
       data["completed_files"] += 1
       write_status(job_id, data)
-      LOGGER.info "[job #{short_id(job_id)}] #{filename}: already PDF/A-2b, skipped conversion"
+      LOGGER.info "#{tag}: already PDF/A-2b, passed through unchanged"
       next
     end
 
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    LOGGER.info "#{tag}: running ocrmypdf #{OCRMYPDF_FLAGS.join(" ")}"
     exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path)
     forced = false
-    if exit_code == EXIT_PDFA_FAILED && initial["force_image"]
-      LOGGER.info "[job #{short_id(job_id)}] #{filename}: PDF/A failed, retrying as page images"
-      exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, force: true)
-      forced = true
+    if exit_code == EXIT_PDFA_FAILED
+      if initial["force_image"]
+        LOGGER.warn "#{tag}: normal conversion ended #{exit_label(exit_code)}; ocrmypdf said:\n#{stderr_digest(stderr)}"
+        LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{OCRMYPDF_FORCE_FLAGS.join(" ")}"
+        exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, force: true)
+        forced = true
+      end
     end
     elapsed = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(1)
 
@@ -297,9 +377,9 @@ def process_job(job_id)
       entry["forced_image"]    = forced
       entry["pdfa_validation"] = run_verapdf(output_path, log_path)
       data["completed_files"] += 1
-      check = entry["pdfa_validation"] ? entry["pdfa_validation"]["result"] : "unchecked"
-      how   = forced ? ", forced as page images" : ""
-      LOGGER.info "[job #{short_id(job_id)}] #{filename}: converted (exit #{exit_code}, #{elapsed}s#{how}, verapdf #{check})"
+      how = forced ? "forced as page images" : "normal"
+      LOGGER.info "#{tag}: converted in #{elapsed}s (#{how}, exit #{exit_label(exit_code)}), " \
+                  "output #{describe_pdf(output_path)}, verapdf post-check #{verapdf_label(entry["pdfa_validation"])}"
     else
       short_err = stderr.lines.last(5).join.strip
       entry["status"]       = "failed"
@@ -309,7 +389,15 @@ def process_job(job_id)
       data["completed_files"] += 1
       data["failed_files"]    += 1
       FileUtils.rm_f(output_path)   # a non-archival leftover must not end up in the download
-      LOGGER.warn "[job #{short_id(job_id)}] #{filename}: failed (exit #{exit_code}, #{elapsed}s#{forced ? ", after forced retry" : ""})"
+      context = if forced
+        "even after the forced page-image retry"
+      elsif exit_code == EXIT_PDFA_FAILED
+        "force archival was off, so no page-image retry"
+      else
+        "no retry for this exit code"
+      end
+      LOGGER.warn "#{tag}: FAILED in #{elapsed}s, exit #{exit_label(exit_code)} (#{context}); ocrmypdf said:\n" \
+                  "#{stderr_digest(stderr)}\n    #{job_log_hint(job_id, filename)}"
     end
 
     write_status(job_id, data)
@@ -354,7 +442,10 @@ def process_job(job_id)
     data["expires_at"]        = (now + JOB_TTL_SECONDS).iso8601
     write_status(job_id, data)
   end
-  LOGGER.info "[job #{short_id(job_id)}] Finished: #{data["status"]} (#{done_files.size} done, #{data["failed_files"]} failed)"
+  total_s  = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - job_started).round(1)
+  download = data["download_filename"] ? ", download #{data["download_filename"]} (#{human_size(data["download_size"])})" : ""
+  LOGGER.info "[job #{short_id(job_id)}] Finished in #{total_s}s: #{data["status"]} — " \
+              "#{done_files.size} done, #{data["failed_files"]} failed#{download}"
 rescue => e
   LOGGER.error "[job-error] #{short_id(job_id)} #{e.class}: #{e.message}\n  #{Array(e.backtrace).first(5).join("\n  ")}"
   begin
@@ -473,8 +564,13 @@ post "/upload" do
     "download_size"     => nil
   }
   write_status(job_id, initial_status)
-  LOGGER.info "[job #{short_id(job_id)}] Accepted: #{processable} queued, #{file_records.size - processable} rejected" \
-              "#{initial_status["force_image"] ? ", force archival on" : ""}"
+  listing = file_records.first(10).map do |f|
+    f["status"] == "queued" ? f["name"] : "#{f["name"]} (rejected: #{f["error"]})"
+  end
+  listing << "… #{file_records.size - 10} more" if file_records.size > 10
+  LOGGER.info "[job #{short_id(job_id)}] Accepted from #{request.ip}: #{processable} queued, " \
+              "#{file_records.size - processable} rejected, force archival #{initial_status["force_image"] ? "ON" : "off"}\n" \
+              "#{listing.map { |l| "    - #{l}" }.join("\n")}"
 
   Thread.new { process_job(job_id) }
 
