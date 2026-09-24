@@ -337,6 +337,28 @@ body {
 .notice .label { color: var(--error); white-space: nowrap; }
 .notice-body { font-size: 13px; color: var(--text-body); flex: 1; min-width: 200px; overflow-wrap: anywhere; }
 
+/* ── FORCE ARCHIVAL OPT-IN ── */
+.force-opt { display: flex; flex-direction: column; gap: 8px; }
+.force-label {
+  display: inline-flex; align-items: center; gap: 10px;
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 700; font-size: 14px; letter-spacing: 2px; text-transform: uppercase;
+  color: var(--text-primary);
+  cursor: pointer;
+  align-self: flex-start;
+}
+.force-label input { width: 18px; height: 18px; accent-color: var(--navy-mid); cursor: pointer; }
+.force-label input:focus-visible { outline: 2px solid var(--flame-yellow); outline-offset: 2px; }
+.force-explain {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-left: 6px solid var(--flame-yellow);
+  padding: 10px 14px;
+  font-size: 13px; line-height: 1.55;
+  color: var(--text-body);
+}
+.force-explain strong { color: var(--text-primary); }
+
 /* ── LISTS (accession list, preserving list, needs attention) ── */
 .list-card {
   background: var(--card-bg);
@@ -379,8 +401,8 @@ body {
 }
 .row--processing { background: var(--row-hover); }
 .row--queued { opacity: 0.55; }
-.row--small { padding: 9px 14px; font-size: 13px; }
-.row--small .row-name { font-size: 13px; }
+.row--small { padding: 9px 14px; font-size: 13px; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.row--small .row-name { font-size: 13px; flex: 1 1 220px; }
 
 .type-chip {
   font-family: 'Press Start 2P', monospace;
@@ -546,7 +568,12 @@ body {
 .vault-timer--low { color: var(--flame-orange); }
 [data-theme="dark"] .vault-timer--low { color: #D2744F; }
 
-.attention-reason { font-size: 13px; color: var(--error); text-align: right; }
+/* Reason keeps to ≤60% of the row so a long message can't crush the filename;
+   it wraps under the name when there isn't room beside it. */
+.attention-reason { font-size: 13px; color: var(--error); text-align: right; flex: 0 1 auto; max-width: 60%; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .attention-reason { max-width: 100%; text-align: left; }
+}
 .attention-reason--warn { color: var(--gold-text); }
 
 /* ── DEAD ENDS ── */

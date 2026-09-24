@@ -36,7 +36,8 @@ Always change `status.json` through `read_status`/`write_status`. `write_status`
 
 **What happens to each file in `process_job`:**
 1. **verapdf pre-check.** If the input already passes PDF/A-2b, it is copied to `output/` unchanged and marked `skipped: true`.
-2. **Otherwise, run `ocrmypdf` with `OCRMYPDF_FLAGS`.** Exit codes 0 and 6 both count as success; 6 means the file already has text (`--skip-text`). On failure, `exit_code` is stored with `error`. The UI maps 8 to password-protected and 2 to a damaged input.
+2. **Otherwise, run `ocrmypdf` with `OCRMYPDF_FLAGS`.** Exit codes 0 and 6 both count as success; 6 means the file already has text (`--skip-text`). On failure, `exit_code` is stored with `error`, and the leftover output is deleted. The UI maps 8 to password-protected, 2 to a damaged input, and 10 to "could not be made archival".
+   - **Force archival (opt-in):** if the upload set `force_image=1` (the UI checkbox; stored as the job's `force_image`), a file that fails with exit 10 (`EXIT_PDFA_FAILED`) is retried once with `OCRMYPDF_FORCE_FLAGS`. That swaps `--skip-text` for `--force-ocr`, which rasterizes every page and OCRs it. It succeeds far more often, but the text is re-OCR'd and links and forms are lost. Success sets `forced_image: true` on the file, and the UI adds a Needs-attention note. Files that convert normally are never forced.
 3. **verapdf post-check.** The result is stored in `pdfa_validation`.
 
 When the job finishes: if exactly one file converted, it is served as-is. If more than one did, they are zipped into `converted_files.zip` and the individual PDFs are deleted. Completion also sets `completed_at`, `download_size`, and `expires_at`.

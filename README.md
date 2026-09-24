@@ -175,6 +175,17 @@ ocrmypdf \
 - `--color-conversion-strategy RGB` — normalises colour spaces to RGB for PDF/A compliance
 - `--jobs 1` — per-file parallelism (multiple files are processed sequentially per job)
 
+### Force archival (opt-in)
+
+Some PDFs contain things Ghostscript can't make PDF/A-compliant. OCRmyPDF still writes a valid PDF, but exits with code 10 ("conversion to PDF/A did not succeed"), and those files fail by default.
+
+If the user ticks **Force archival for difficult files** before uploading, each file that fails this way is retried once with `--force-ocr` instead of `--skip-text`. That rebuilds every page as an image with an OCR text layer, which passes PDF/A far more often. The cost:
+- The file is bigger.
+- The text is re-read by OCR and can contain mistakes.
+- Links, bookmarks and form fields stop working.
+
+Files that convert normally are never forced. Forced files are marked "as images" in the UI and listed under Needs attention.
+
 ---
 
 ## Security Notes

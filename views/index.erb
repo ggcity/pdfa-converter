@@ -147,6 +147,20 @@
       <ul id="file-list" class="file-list"></ul>
     </div>
 
+    <div class="force-opt">
+      <label class="force-label">
+        <input type="checkbox" id="force-image" aria-describedby="force-explain">
+        <span>Force archival for difficult files</span>
+      </label>
+      <div id="force-explain" class="force-explain d-none">
+        Some PDFs contain things the archival format doesn't allow, so they can't be
+        preserved as they are. With this on, <strong>only those files</strong> are rebuilt
+        as a picture of each page with searchable text laid on top. They will pass as PDF/A, but:
+        the file gets bigger, the text is re-read by OCR and can contain mistakes, and links,
+        bookmarks and form fields stop working. Files that convert normally are not changed.
+      </div>
+    </div>
+
     <div class="actions">
       <div class="actions-hint">ZIPs are opened and each PDF inside is preserved separately.</div>
       <button id="convert-btn" type="button" class="press-btn" disabled>Preserve records</button>
@@ -250,6 +264,8 @@ const fileListEl      = document.getElementById("file-list");
 const fileListCount   = document.getElementById("file-list-count");
 const fileWarnings    = document.getElementById("file-warnings");
 const convertBtn      = document.getElementById("convert-btn");
+const forceImage      = document.getElementById("force-image");
+const forceExplain    = document.getElementById("force-explain");
 const uploadSection   = document.getElementById("upload-section");
 const progressSection = document.getElementById("progress-section");
 const progressBar     = document.getElementById("progress-bar");
@@ -383,6 +399,11 @@ function renderFileList() {
    ========================================================================= */
 convertBtn.addEventListener("click", startConversion);
 
+// Explain what "force" does as soon as it's switched on
+forceImage.addEventListener("change", () => {
+  forceExplain.classList.toggle("d-none", !forceImage.checked);
+});
+
 async function startConversion() {
   if (selectedFiles.length === 0) return;
 
@@ -390,6 +411,7 @@ async function startConversion() {
 
   const formData = new FormData();
   selectedFiles.forEach((f) => formData.append("files[]", f, f.name));
+  if (forceImage.checked) formData.append("force_image", "1");
 
   // One thing on screen at a time
   hide(uploadSection);
@@ -481,7 +503,8 @@ function recordBadge(f) {
     const profile = f.pdfa_validation && f.pdfa_validation.profile
       ? "PDF/A-" + String(f.pdfa_validation.profile).toUpperCase()
       : "PDF/A";
-    return `<span class="stamp stamp--pass">Archival · ${escHtml(profile)}</span>`;
+    const how = f.forced_image ? " · as images" : "";
+    return `<span class="stamp stamp--pass">Archival · ${escHtml(profile)}${how}</span>`;
   }
   if (kind === "warn") {
     return f.pdfa_validation
@@ -506,7 +529,19 @@ function plainError(f) {
   if (f.exit_code === 2 || /damaged|parse|corrupt|not a valid pdf|magic bytes/i.test(raw)) {
     return "File is damaged and could not be read";
   }
-  return raw || "Could not be converted";
+  if (f.exit_code === 10 || /conversion to PDF\/A did not succeed/i.test(raw)) {
+    return f.forced_image
+      ? "Could not be made archival (PDF/A), even as page images"
+      : "Could not be made archival (PDF/A) — turn on “Force archival for difficult files” and try again";
+  }
+  return shortRaw(raw) || "Could not be converted";
+}
+
+// The raw error is the tail of OCRmyPDF's output; show only its last line, capped.
+function shortRaw(raw) {
+  const lines = String(raw).split("\n").map((l) => l.trim()).filter(Boolean);
+  const last = lines.length ? lines[lines.length - 1] : "";
+  return last.length > 160 ? last.slice(0, 157) + "…" : last;
 }
 
 /* =========================================================================
@@ -621,7 +656,14 @@ function showCompletion(job) {
     f.pdfa_validation ? "Included, but did not pass the PDF/A check" : "Included, but was not checked against PDF/A",
     true
   ));
-  if (fail.length + warn.length > 0) show(attentionSection); else hide(attentionSection);
+  // Forced files are archival, but the user should know how they were made
+  const forced = files.filter((f) => f.status === "done" && f.forced_image);
+  forced.forEach((f) => addAttention(
+    f.name,
+    "Preserved as page images — text was re-read by OCR; links and form fields no longer work",
+    true
+  ));
+  if (fail.length + warn.length + forced.length > 0) show(attentionSection); else hide(attentionSection);
 
   show(downloadArea);
 

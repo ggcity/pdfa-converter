@@ -187,10 +187,18 @@ OCRMYPDF_FLAGS = %w[
   --jobs 1
 ].freeze
 
-def run_ocrmypdf(input_path, output_path, log_path)
-  cmd = [OCRMYPDF_CMD, *OCRMYPDF_FLAGS, input_path, output_path]
+# "Force archival" retry: rasterize every page and OCR it instead of keeping the
+# existing text layer. Only used, when the user opts in, for files whose normal
+# conversion ends in EXIT_PDFA_FAILED. (--force-ocr and --skip-text are exclusive.)
+OCRMYPDF_FORCE_FLAGS = OCRMYPDF_FLAGS.map { |f| f == "--skip-text" ? "--force-ocr" : f }.freeze
+EXIT_PDFA_FAILED     = 10   # output is a valid PDF, but not PDF/A
+
+def run_ocrmypdf(input_path, output_path, log_path, force: false)
+  flags = force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS
+  cmd = [OCRMYPDF_CMD, *flags, input_path, output_path]
   stdout, stderr, status = Open3.capture3(*cmd)
-  File.write(log_path, "STDOUT:\n#{stdout}\n\nSTDERR:\n#{stderr}\n")
+  heading = force ? "OCRMYPDF (forced as page images)" : "OCRMYPDF"
+  File.open(log_path, "a") { |f| f.write("\n\n#{heading}\nSTDOUT:\n#{stdout}\n\nSTDERR:\n#{stderr}\n") }
   [status.exitstatus, stderr]
 end
 
@@ -270,6 +278,12 @@ def process_job(job_id)
 
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path)
+    forced = false
+    if exit_code == EXIT_PDFA_FAILED && initial["force_image"]
+      LOGGER.info "[job #{short_id(job_id)}] #{filename}: PDF/A failed, retrying as page images"
+      exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, force: true)
+      forced = true
+    end
     elapsed = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(1)
 
     # Read fresh copy, update result
@@ -280,18 +294,22 @@ def process_job(job_id)
     if exit_code == 0 || exit_code == 6
       entry["status"]          = "done"
       entry["error"]           = nil
+      entry["forced_image"]    = forced
       entry["pdfa_validation"] = run_verapdf(output_path, log_path)
       data["completed_files"] += 1
       check = entry["pdfa_validation"] ? entry["pdfa_validation"]["result"] : "unchecked"
-      LOGGER.info "[job #{short_id(job_id)}] #{filename}: converted (exit #{exit_code}, #{elapsed}s, verapdf #{check})"
+      how   = forced ? ", forced as page images" : ""
+      LOGGER.info "[job #{short_id(job_id)}] #{filename}: converted (exit #{exit_code}, #{elapsed}s#{how}, verapdf #{check})"
     else
       short_err = stderr.lines.last(5).join.strip
-      entry["status"]    = "failed"
-      entry["error"]     = short_err
-      entry["exit_code"] = exit_code
+      entry["status"]       = "failed"
+      entry["error"]        = short_err
+      entry["exit_code"]    = exit_code
+      entry["forced_image"] = forced
       data["completed_files"] += 1
       data["failed_files"]    += 1
-      LOGGER.warn "[job #{short_id(job_id)}] #{filename}: failed (exit #{exit_code}, #{elapsed}s)"
+      FileUtils.rm_f(output_path)   # a non-archival leftover must not end up in the download
+      LOGGER.warn "[job #{short_id(job_id)}] #{filename}: failed (exit #{exit_code}, #{elapsed}s#{forced ? ", after forced retry" : ""})"
     end
 
     write_status(job_id, data)
@@ -440,6 +458,7 @@ post "/upload" do
   initial_status = {
     "job_id"            => job_id,
     "status"            => "processing",
+    "force_image"       => params[:force_image] == "1",
     "total_files"       => processable,
     "completed_files"   => 0,
     "failed_files"      => 0,
@@ -454,7 +473,8 @@ post "/upload" do
     "download_size"     => nil
   }
   write_status(job_id, initial_status)
-  LOGGER.info "[job #{short_id(job_id)}] Accepted: #{processable} queued, #{file_records.size - processable} rejected"
+  LOGGER.info "[job #{short_id(job_id)}] Accepted: #{processable} queued, #{file_records.size - processable} rejected" \
+              "#{initial_status["force_image"] ? ", force archival on" : ""}"
 
   Thread.new { process_job(job_id) }
 
