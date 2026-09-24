@@ -1,7 +1,7 @@
 GEM
   remote: https://rubygems.org/
   specs:
-    base64 (0.3.0)
+    base64 (0.1.0)
     logger (1.7.0)
     mustermann (3.0.4)
       ruby2_keywords (~> 0.0.1)
@@ -34,14 +34,14 @@ PLATFORMS
   x86_64-linux
 
 DEPENDENCIES
-  base64
+  base64 (= 0.1.0)
   puma
   rackup
   rubyzip
   sinatra
 
 CHECKSUMS
-  base64 (0.3.0) sha256=27337aeabad6ffae05c265c450490628ef3ebd4b67be58257393227588f5a97b
+  base64 (0.1.0) sha256=1ca71300b558526985142329759b79f03fecaf7c0f7cf8b2c7721c6f2c30105e
   logger (1.7.0) sha256=196edec7cc44b66cfb40f9755ce11b392f21f7967696af15d274dde7edff0203
   mustermann (3.0.4) sha256=85fadcb6b3c6493a8b511b42426f904b7f27b282835502233dd154daab13aa22
   nio4r (2.7.5) sha256=6c90168e48fb5f8e768419c93abb94ba2b892a1d0602cb06eef16d8b7df1dca1
