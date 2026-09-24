@@ -7,6 +7,17 @@ require "logger"
 require "time"
 require "zip"
 
+# Passenger can start the app without a UTF-8 locale (no LANG), and Ruby then
+# tags files and tool output as US-ASCII: a non-ASCII PDF title crashed a log
+# line with Encoding::CompatibilityError. Treat everything as UTF-8.
+Encoding.default_external = Encoding::UTF_8
+
+# Tool output as valid UTF-8. Ghostscript can echo raw PDFDocEncoding bytes
+# from DOCINFO; invalid bytes become "?" instead of breaking regex/interpolation.
+def utf8(text)
+  text.to_s.dup.force_encoding(Encoding::UTF_8).scrub("?")
+end
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -291,6 +302,7 @@ def plain_docinfo_copy(input_path, work_dir)
   FileUtils.mkdir_p(work_dir)
   dst = File.join(work_dir, File.basename(input_path))
   out, err, st = Open3.capture3(OCRMYPDF_PYTHON, "-c", PLAIN_DOCINFO_PY, input_path, dst)
+  out, err = utf8(out), utf8(err)
   return [nil, "could not rewrite metadata: #{(err.strip.lines.last || "exit #{st.exitstatus}").strip}"] unless st.success?
   return [nil, "no non-ASCII document info to simplify"] unless File.exist?(dst)
   [dst, out.strip]
@@ -305,6 +317,7 @@ end
 Thread.new do
   version = lambda do |*cmd|
     out, st = Open3.capture2e(*cmd)
+    out = utf8(out)
     st.success? ? out.strip.lines.first.to_s.strip : "error (#{out.strip.lines.last.to_s.strip})"
   rescue SystemCallError
     "not found"
@@ -329,6 +342,7 @@ def run_ocrmypdf(input_path, output_path, log_path, force: false)
   flags = force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS
   cmd = [OCRMYPDF_CMD, *flags, input_path, output_path]
   stdout, stderr, status = Open3.capture3(*cmd)
+  stdout, stderr = utf8(stdout), utf8(stderr)
   heading = force ? "OCRMYPDF (forced as page images)" : "OCRMYPDF"
   File.open(log_path, "a") { |f| f.write("\n\n#{heading}\nSTDOUT:\n#{stdout}\n\nSTDERR:\n#{stderr}\n") }
   [status.exitstatus, stderr]
@@ -351,6 +365,7 @@ def run_verapdf(output_path, log_path)
   ]
 
   stdout, stderr, _status = Open3.capture3(*cmd)
+  stdout, stderr = utf8(stdout), utf8(stderr)
   File.open(log_path, "a") { |f| f.write("\n\nVERAPDF:\n#{stdout}#{stderr}") }
 
   first_line = stdout.lines.first.to_s.strip
