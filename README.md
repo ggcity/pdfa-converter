@@ -182,7 +182,31 @@ Some PDFs contain things Ghostscript can't make PDF/A-compliant. OCRmyPDF still 
 **1. Plain document info (automatic).** Ghostscript 9.54, the version RHEL 9 ships in production, can't copy non-ASCII document info into PDF/A metadata. An en dash in the title is enough. It discards the info and the PDF/A marker with it, so OCRmyPDF reports "No PDF/A metadata in XMP". Ghostscript 10.x doesn't have this problem, which is why such files work in dev but not in prod.
 - On exit 10, the app writes a copy whose title, author, subject and keywords use plain ASCII (`–` becomes `-`, `é` becomes `e`, curly quotes become straight ones) and retries normally.
 - Page content is untouched, and the changes are logged in `logs/app.log`.
-- The real fix is a newer Ghostscript on the server. Build 10.05.x into `/usr/local` and make sure Passenger's PATH puts `/usr/local/bin` first. Avoid 10.6.0 and later, which OCRmyPDF warns have JPEG encoding bugs. The boot line in `app.log` shows which `gs` each worker uses.
+- The real fix is a newer Ghostscript on the server. See **Local Ghostscript** below.
+
+When a file still fails the PDF/A step after every retry, the app runs one extra `ocrmypdf -v 1` pass on the last attempt. The full verbose output goes into the per-file log, and Ghostscript's own messages go into `app.log` under "Ghostscript diagnostics". Ghostscript only reports why it gave up PDF/A mode at this verbosity.
+
+### Local Ghostscript (optional, recommended on RHEL 9)
+
+RHEL 9 ships Ghostscript 9.54.0 (2021), which fails PDF/A conversion on some files that newer versions handle. You can build a newer one into the app directory without touching the system package. If `vendor/ghostscript/bin/gs` exists, the app puts that directory first on PATH at startup, so OCRmyPDF uses it. The boot line in `app.log` shows which `gs` each worker picked up.
+
+Use **10.05.1**. OCRmyPDF warns that 10.6.0 and later have JPEG encoding bugs. Get the GPL Ghostscript source tarball (`ghostscript-10.05.1.tar.gz`, not the `ghostpdl` or `gs` binary packages) from https://github.com/ArtifexSoftware/ghostpdl-downloads/releases (tag `gs10051`). It bundles its own zlib, libpng, libjpeg, lcms2, freetype, openjpeg and jbig2dec, so it only needs a compiler:
+
+```bash
+sudo dnf install gcc make            # once, if not already installed
+
+cd /tmp
+curl -LO https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10051/ghostscript-10.05.1.tar.gz
+tar xzf ghostscript-10.05.1.tar.gz && cd ghostscript-10.05.1
+./configure --prefix=/var/www/rails/pdfa-converter/vendor/ghostscript \
+  --without-x --disable-cups --disable-gtk --disable-dbus --without-tesseract
+make -j"$(nproc)" && make install
+
+/var/www/rails/pdfa-converter/vendor/ghostscript/bin/gs --version   # 10.05.1
+cd /var/www/rails/pdfa-converter && touch tmp/restart.txt
+```
+
+Build and install as the user that owns the app directory (`rails`). `vendor/ghostscript/` is git-ignored. To go back to the system Ghostscript, delete that directory and restart. Keep this build up to date yourself: it won't get RHEL security updates, and Ghostscript processes untrusted PDFs (OCRmyPDF runs it with `-dSAFER`).
 
 **2. Force archival (opt-in, last resort).** If the user ticked **Force archival for difficult files** before uploading, a file that still fails is retried once with `--force-ocr` instead of `--skip-text`. That rebuilds every page as an image with an OCR text layer, which passes PDF/A far more often. The cost:
 - The file is bigger.

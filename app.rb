@@ -18,6 +18,13 @@ def utf8(text)
   text.to_s.dup.force_encoding(Encoding::UTF_8).scrub("?")
 end
 
+# A Ghostscript built into vendor/ghostscript (see README) wins over the system
+# one: ocrmypdf runs whichever `gs` is first on PATH. The boot log shows which.
+LOCAL_GS_BIN = File.expand_path("vendor/ghostscript/bin", __dir__)
+if File.executable?(File.join(LOCAL_GS_BIN, "gs"))
+  ENV["PATH"] = [LOCAL_GS_BIN, ENV["PATH"]].compact.join(File::PATH_SEPARATOR)
+end
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -42,6 +49,11 @@ end
 # Job IDs are download credentials: only ever log a prefix.
 def short_id(job_id)
   "#{job_id.to_s[0, 8]}…"
+end
+
+# Shorten any job ID inside a line of tool output (verbose ocrmypdf prints paths).
+def redact_job_ids(text)
+  text.to_s.gsub(/\h{8}-\h{4}-\h{4}-\h{4}-\h{12}/) { |id| short_id(id) }
 end
 
 # Request logger that shortens job IDs in paths (/status/<uuid>, /download/<uuid>).
@@ -255,7 +267,7 @@ def stderr_digest(stderr, max_lines: 30)
   picked += block.empty? ? before.last(5) : block.reject(&:empty?)
   picked = picked.uniq if block.empty?
   return "    | (no output)" if picked.empty?
-  picked.last(max_lines).map { |l| "    | #{l}" }.join("\n")
+  picked.last(max_lines).map { |l| "    | #{redact_job_ids(l)}" }.join("\n")
 end
 
 def human_size(bytes)
@@ -375,6 +387,34 @@ def run_ocrmypdf(input_path, output_path, log_path, force: false, extra: [])
   heading = "OCRMYPDF #{flags.join(" ")}"
   File.open(log_path, "a") { |f| f.write("\n\n#{heading}\nSTDOUT:\n#{stdout}\n\nSTDERR:\n#{stderr}\n") }
   [status.exitstatus, stderr]
+end
+
+# Ghostscript's own messages (e.g. "GPL Ghostscript 9.54.0: Text string detected
+# in DOCINFO ... discarding DOCINFO") only reach ocrmypdf's output with -v1,
+# which floods it with debug lines. So after a final PDF/A failure, run once
+# more verbosely: the full output goes to the per-file log, and the Ghostscript
+# lines are returned for app.log. The output file of this pass is thrown away.
+GS_DIAG_RE = %r{GPL\sGhostscript|\*{4}|error|warning|pdfa|pdf/a|docinfo|xmp|
+                outputintent|icc|font|transparen|annot|embedded}xi
+
+# -v1 debug lines that only matched because a file path contains "pdfa"
+DIAG_NOISE_RE = %r{\ARunning:\s\[|\Aos\.\w+\(|\A/\S+\s->\s/}
+
+def ghostscript_diagnostics(input_path, work_dir, log_path, force:, extra:)
+  FileUtils.mkdir_p(work_dir)
+  scratch = File.join(work_dir, "diagnostic-#{File.basename(input_path)}")
+  flags   = (force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS) + extra + ["-v", "1"]
+  _out, err, _st = Open3.capture3(OCRMYPDF_CMD, *flags, input_path, scratch)
+  err = utf8(err)
+  File.open(log_path, "a") { |f| f.write("\n\nDIAGNOSTIC OCRMYPDF #{flags.join(" ")}\nSTDERR:\n#{err}\n") }
+  lines = err.lines.map(&:rstrip).reject(&:empty?)
+  lines.reject { |l| l.match?(DIAG_NOISE_RE) }
+       .select { |l| l.match?(GS_DIAG_RE) }
+       .map { |l| redact_job_ids(l) }.uniq.last(40)
+rescue SystemCallError => e
+  ["could not run the diagnostic pass: #{e.message}"]
+ensure
+  FileUtils.rm_f(scratch) if scratch
 end
 
 # Run verapdf via podman to verify PDF/A conformance.
@@ -539,6 +579,12 @@ def process_job(job_id)
       end
       LOGGER.warn "#{tag}: FAILED in #{elapsed}s, exit #{exit_label(exit_code)} (#{context}); ocrmypdf said:\n" \
                   "#{stderr_digest(stderr)}\n    #{job_log_hint(job_id, filename)}"
+      if exit_code == EXIT_PDFA_FAILED
+        gs_lines = ghostscript_diagnostics(retry_input, File.join(job_dir(job_id), "work"), log_path,
+                                           force: forced, extra: extra_flags)
+        body = gs_lines.empty? ? "    | (no Ghostscript messages)" : gs_lines.map { |l| "    | #{l}" }.join("\n")
+        LOGGER.warn "#{tag}: Ghostscript diagnostics (ocrmypdf -v 1 rerun of the last attempt):\n#{body}"
+      end
     end
 
     write_status(job_id, data)

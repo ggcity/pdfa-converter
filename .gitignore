@@ -4,3 +4,4 @@ tmp/jobs/*/
 tmp/jobs/.gitkeep
 *.log
 logs/
+vendor/ghostscript/
