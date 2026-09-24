@@ -222,11 +222,40 @@ STDERR_DIAG_RE = %r{warn|error|fail|ghostscript|cannot|could not|unable|invalid|
                     not\s(?:supported|allowed|a\s)|pdf/a|xmp|font|transparen|
                     encrypt|signature|colou?r|icc|annotation|embedded}xi
 
-def stderr_digest(stderr, max_lines: 25)
-  lines  = stderr.to_s.lines.map(&:rstrip).reject(&:empty?)
-  picked = (lines.select { |l| l.match?(STDERR_DIAG_RE) } + lines.last(5)).uniq.last(max_lines)
+# ocrmypdf ends a fatal error with a block like
+#   EncryptedPdfError: Input PDF is encrypted. The encryption must be removed to
+#   perform OCR.
+#   ...
+# That block is kept whole; filtering it by keyword chops the message apart.
+EXCEPTION_LINE_RE = /\A\s*[A-Z]\w*(?:Error|Exception)\b[^:]*:/
+
+def stderr_exception_block(lines)
+  i = lines.rindex { |l| l.match?(EXCEPTION_LINE_RE) }
+  i ? lines[i..] : []
+end
+
+# What the web page shows, verbatim: ocrmypdf's error block when there is one,
+# otherwise its warning/error lines (e.g. exit 10 has no exception), otherwise
+# the last few lines.
+def stderr_highlights(stderr, max_lines: 20)
+  lines  = stderr.to_s.lines.map(&:rstrip)
+  picked = stderr_exception_block(lines)
+  picked = lines.reject(&:empty?).select { |l| l.match?(STDERR_DIAG_RE) } if picked.empty?
+  picked = lines.reject(&:empty?).last(3) if picked.empty?
+  picked.first(max_lines).join("\n").gsub(/\n{3,}/, "\n\n").strip
+end
+
+# For app.log: warning lines from before the error, then the whole error block
+# (or the last few lines when there is no error block).
+def stderr_digest(stderr, max_lines: 30)
+  lines  = stderr.to_s.lines.map(&:rstrip)
+  block  = stderr_exception_block(lines)
+  before = lines[0, lines.length - block.length].reject(&:empty?)
+  picked = before.select { |l| l.match?(STDERR_DIAG_RE) }.uniq
+  picked += block.empty? ? before.last(5) : block.reject(&:empty?)
+  picked = picked.uniq if block.empty?
   return "    | (no output)" if picked.empty?
-  picked.map { |l| "    | #{l}" }.join("\n")
+  picked.last(max_lines).map { |l| "    | #{l}" }.join("\n")
 end
 
 def human_size(bytes)
@@ -338,12 +367,12 @@ Thread.new do
               "    PATH=#{ENV["PATH"]}"
 end
 
-def run_ocrmypdf(input_path, output_path, log_path, force: false)
-  flags = force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS
+def run_ocrmypdf(input_path, output_path, log_path, force: false, extra: [])
+  flags = (force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS) + extra
   cmd = [OCRMYPDF_CMD, *flags, input_path, output_path]
   stdout, stderr, status = Open3.capture3(*cmd)
   stdout, stderr = utf8(stdout), utf8(stderr)
-  heading = force ? "OCRMYPDF (forced as page images)" : "OCRMYPDF"
+  heading = "OCRMYPDF #{flags.join(" ")}"
   File.open(log_path, "a") { |f| f.write("\n\n#{heading}\nSTDOUT:\n#{stdout}\n\nSTDERR:\n#{stderr}\n") }
   [status.exitstatus, stderr]
 end
@@ -434,6 +463,16 @@ def process_job(job_id)
     forced          = false
     docinfo_changes = nil
     retry_input     = input_path
+    extra_flags     = []
+
+    # Retry 0 (automatic): signed PDFs. Any conversion alters the file, so the
+    # signature can't survive it; ocrmypdf refuses unless told to invalidate it.
+    if exit_code == 2 && stderr.include?("DigitalSignatureError")
+      LOGGER.warn "#{tag}: input has a digital signature; retrying with --invalidate-digital-signatures " \
+                  "(the archival copy will NOT carry a valid signature; keep the signed original)"
+      extra_flags = ["--invalidate-digital-signatures"]
+      exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, extra: extra_flags)
+    end
 
     # Retry 1 (automatic, content untouched): plain-ASCII document info
     if exit_code == EXIT_PDFA_FAILED
@@ -441,7 +480,7 @@ def process_job(job_id)
       plain_path, note = plain_docinfo_copy(input_path, File.join(job_dir(job_id), "work"))
       if plain_path
         LOGGER.info "#{tag}: retrying with plain-ASCII document info:\n#{note.lines.map { |l| "    | #{l.rstrip}" }.join("\n")}"
-        exit_code, stderr = run_ocrmypdf(plain_path, output_path, log_path)
+        exit_code, stderr = run_ocrmypdf(plain_path, output_path, log_path, extra: extra_flags)
         docinfo_changes = note
         retry_input     = plain_path
         if exit_code == EXIT_PDFA_FAILED
@@ -454,8 +493,8 @@ def process_job(job_id)
 
     # Retry 2 (last resort, only when the user opted in): pages as images
     if exit_code == EXIT_PDFA_FAILED && initial["force_image"]
-      LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{OCRMYPDF_FORCE_FLAGS.join(" ")}"
-      exit_code, stderr = run_ocrmypdf(retry_input, output_path, log_path, force: true)
+      LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{(OCRMYPDF_FORCE_FLAGS + extra_flags).join(" ")}"
+      exit_code, stderr = run_ocrmypdf(retry_input, output_path, log_path, force: true, extra: extra_flags)
       forced = true
     end
     elapsed = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(1)
@@ -470,19 +509,22 @@ def process_job(job_id)
       entry["error"]           = nil
       entry["forced_image"]    = forced
       entry["docinfo_simplified"] = !docinfo_changes.nil?
+      entry["signature_invalidated"] = !extra_flags.empty?
       entry["pdfa_validation"] = run_verapdf(output_path, log_path)
       data["completed_files"] += 1
       how = if forced then "forced as page images"
             elsif docinfo_changes then "normal, with plain-ASCII document info"
             else "normal"
             end
+      how += ", digital signature invalidated" unless extra_flags.empty?
       LOGGER.info "#{tag}: converted in #{elapsed}s (#{how}, exit #{exit_label(exit_code)}), " \
                   "output #{describe_pdf(output_path)}, verapdf post-check #{verapdf_label(entry["pdfa_validation"])}"
     else
-      short_err = stderr.lines.last(5).join.strip
       entry["status"]       = "failed"
-      entry["error"]        = short_err
+      entry["error"]        = stderr_highlights(stderr)   # shown verbatim on the page
       entry["exit_code"]    = exit_code
+      entry["exit_name"]    = OCRMYPDF_EXIT_NAMES.fetch(exit_code, "unknown")
+      entry["signature_invalidated"] = !extra_flags.empty?
       entry["forced_image"] = forced
       entry["docinfo_simplified"] = !docinfo_changes.nil?
       data["completed_files"] += 1

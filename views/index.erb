@@ -518,30 +518,16 @@ function recordBadge(f) {
   return `<span class="state-label">QUEUED</span>`;
 }
 
-// Plain-language error text; falls back to the raw server string.
-function plainError(f) {
-  const raw = f.error || "";
-  if (f.exit_code === 8 || /encrypt|password/i.test(raw)) {
-    return "Password-protected. Remove the password and try again.";
-  }
-  if (/unsupported file type/i.test(raw)) return "Only .pdf and .zip can be preserved";
-  if (/zip extraction failed/i.test(raw)) return "ZIP could not be opened";
-  if (f.exit_code === 2 || /damaged|parse|corrupt|not a valid pdf|magic bytes/i.test(raw)) {
-    return "File is damaged and could not be read";
-  }
-  if (f.exit_code === 10 || /conversion to PDF\/A did not succeed/i.test(raw)) {
-    return f.forced_image
-      ? "Could not be made archival (PDF/A), even as page images"
-      : "Could not be made archival (PDF/A). Something inside this PDF blocks the archival format";
-  }
-  return shortRaw(raw) || "Could not be converted";
+// The actual error as the server recorded it: the ocrmypdf exit code and name,
+// then ocrmypdf's own error lines (or the server's reason for a rejected file).
+function errorText(f) {
+  const code = f.exit_code != null ? `ocrmypdf exit ${f.exit_code} ${f.exit_name || ""}`.trim() : "";
+  const msg  = String(f.error || "").trim();
+  return [code, msg].filter(Boolean).join("\n") || "No error output was recorded";
 }
 
-// The raw error is the tail of OCRmyPDF's output; show only its last line, capped.
-function shortRaw(raw) {
-  const lines = String(raw).split("\n").map((l) => l.trim()).filter(Boolean);
-  const last = lines.length ? lines[lines.length - 1] : "";
-  return last.length > 160 ? last.slice(0, 157) + "…" : last;
+function errorBlock(f) {
+  return `<pre class="error-text">${escHtml(errorText(f))}</pre>`;
 }
 
 /* =========================================================================
@@ -588,7 +574,7 @@ function updateProgressUI(job) {
     li.className = "row" + (kind === "active" ? " row--processing" : "") + (kind === "queued" ? " row--queued" : "");
     const name = `<span class="row-name">${escHtml(f.name)}</span>`;
     li.innerHTML = kind === "fail"
-      ? `<div class="row-stack">${name}<span class="row-error">${escHtml(plainError(f))}</span></div>${recordBadge(f)}`
+      ? `<div class="row-stack">${name}${errorBlock(f)}</div>${recordBadge(f)}`
       : `${name}${recordBadge(f)}`;
     statusList.appendChild(li);
   });
@@ -650,20 +636,22 @@ function showCompletion(job) {
 
   // Needs attention: failures first, then records that converted but aren't verified archival
   attentionList.innerHTML = "";
-  fail.forEach((f) => addAttention(f.name, plainError(f), false));
-  warn.forEach((f) => addAttention(
-    f.name,
-    f.pdfa_validation ? "Included, but did not pass the PDF/A check" : "Included, but was not checked against PDF/A",
-    true
-  ));
+  fail.forEach((f) => addAttention(f.name, errorBlock(f)));
+  warn.forEach((f) => addAttention(f.name, noteBlock(
+    f.pdfa_validation
+      ? `Included, but failed the PDF/A check. verapdf: ${f.pdfa_validation.details || f.pdfa_validation.result}`
+      : "Included, but not checked: verapdf did not run (podman or the verapdf/cli image is unavailable)"
+  )));
+  // Signed PDFs can only be converted by invalidating the signature
+  files.filter((f) => f.status === "done" && f.signature_invalidated).forEach((f) => addAttention(f.name, noteBlock(
+    "Had a digital signature. Converted with --invalidate-digital-signatures, so this copy is NOT validly signed. Keep the signed original."
+  )));
   // Forced files are archival, but the user should know how they were made
   const forced = files.filter((f) => f.status === "done" && f.forced_image);
-  forced.forEach((f) => addAttention(
-    f.name,
-    "Preserved as page images. Text was re-read by OCR; links and form fields no longer work",
-    true
-  ));
-  if (fail.length + warn.length + forced.length > 0) show(attentionSection); else hide(attentionSection);
+  forced.forEach((f) => addAttention(f.name, noteBlock(
+    "Preserved as page images (--force-ocr). Text was re-read by OCR; links and form fields no longer work."
+  )));
+  if (attentionList.children.length > 0) show(attentionSection); else hide(attentionSection);
 
   show(downloadArea);
 
@@ -674,13 +662,16 @@ function showCompletion(job) {
   }
 }
 
-function addAttention(name, reason, isWarn) {
+// reasonHtml is already escaped: errorBlock() or noteBlock()
+function addAttention(name, reasonHtml) {
   const li = document.createElement("li");
-  li.className = "row row--small";
-  li.innerHTML =
-    `<span class="row-name">${escHtml(name)}</span>` +
-    `<span class="attention-reason${isWarn ? " attention-reason--warn" : ""}">${escHtml(reason)}</span>`;
+  li.className = "row row--small row--stacked";
+  li.innerHTML = `<span class="row-name">${escHtml(name)}</span>${reasonHtml}`;
   attentionList.appendChild(li);
+}
+
+function noteBlock(text) {
+  return `<span class="attention-note">${escHtml(text)}</span>`;
 }
 
 // Check the vault is still open before navigating: a closed vault swaps in the S4 card
@@ -741,7 +732,7 @@ function showDeadEnd(kind, detail, files) {
   const list = failedFiles.length
     ? `<ul class="dead-end-list">` + failedFiles.map((f) =>
         `<li><span class="row-name">${escHtml(f.name)}</span>` +
-        `<span class="attention-reason">${escHtml(plainError(f))}</span></li>`).join("") + `</ul>`
+        `${errorBlock(f)}</li>`).join("") + `</ul>`
     : "";
 
   deadEnd.classList.toggle("dead-end--wide", failedFiles.length > 0);
