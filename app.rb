@@ -3,6 +3,8 @@ require "json"
 require "securerandom"
 require "fileutils"
 require "open3"
+require "logger"
+require "time"
 require "zip"
 
 # ---------------------------------------------------------------------------
@@ -11,12 +13,43 @@ require "zip"
 
 MAX_UPLOAD_BYTES = (ENV["MAX_UPLOAD_MB"] || 100).to_i * 1024 * 1024
 JOBS_DIR         = File.expand_path("tmp/jobs", __dir__)
-JOB_TTL_SECONDS  = 3600       # 1 hour expiry shown to users
+LOG_DIR          = File.expand_path("logs", __dir__)
+JOB_TTL_SECONDS  = 3600       # vault stays open 1 hour after the job completes
 BOOT_CLEANUP_AGE = 6 * 3600   # delete on boot if older than 6 hours
+
+# Production (Passenger) appends to logs/app.log; everywhere else logs to stdout.
+# No built-in rotation — it isn't safe across Passenger processes; use logrotate.
+LOGGER = if ENV["RACK_ENV"] == "production"
+  FileUtils.mkdir_p(LOG_DIR)
+  log_file = File.open(File.join(LOG_DIR, "app.log"), "a")
+  log_file.sync = true
+  Logger.new(log_file)
+else
+  Logger.new($stdout)
+end
+
+# Job IDs are download credentials — only ever log a prefix.
+def short_id(job_id)
+  "#{job_id.to_s[0, 8]}…"
+end
+
+# Request logger that shortens job IDs in paths (/status/<uuid>, /download/<uuid>).
+class RedactingCommonLogger < Rack::CommonLogger
+  UUID_RE = /\h{8}-\h{4}-\h{4}-\h{4}-\h{12}/
+
+  private
+
+  def log(env, *args)
+    path = env[Rack::PATH_INFO].to_s
+    env  = env.merge(Rack::PATH_INFO => path.gsub(UUID_RE) { |id| short_id(id) }) if path.match?(UUID_RE)
+    super(env, *args)
+  end
+end
 
 configure do
   set :bind, "0.0.0.0"
   set :max_request_body_size, MAX_UPLOAD_BYTES
+  set :logging, false
 
   FileUtils.mkdir_p(JOBS_DIR)
 
@@ -26,11 +59,12 @@ configure do
     age = Time.now - File.mtime(dir)
     if age > BOOT_CLEANUP_AGE
       FileUtils.rm_rf(dir)
-      short = File.basename(dir)[0, 8]
-      $stderr.puts "[boot-cleanup] Removed stale job #{short}… (age #{(age / 3600).round(1)}h)"
+      LOGGER.info "[boot-cleanup] Removed stale job #{short_id(File.basename(dir))} (age #{(age / 3600).round(1)}h)"
     end
   end
 end
+
+use RedactingCommonLogger, LOGGER
 
 # ---------------------------------------------------------------------------
 # status.json helpers
@@ -59,6 +93,27 @@ def write_status(job_id, data)
   tmp  = "#{path}.#{Process.pid}.tmp"
   File.write(tmp, JSON.generate(data))
   File.rename(tmp, path)
+end
+
+# The vault closes JOB_TTL_SECONDS after completion; expires_at is nil until then.
+def vault_closed?(data)
+  return true if data["vault_closed"]
+  return false unless data["expires_at"]
+  Time.now >= Time.parse(data["expires_at"])
+rescue ArgumentError
+  false
+end
+
+# Delete the converted output and mark the job closed. Safe to call repeatedly.
+def close_vault!(job_id, data)
+  FileUtils.rm_rf(File.join(job_dir(job_id), "output"))
+  return data if data["vault_closed"]
+  data["vault_closed"]      = true
+  data["download_ready"]    = false
+  data["download_filename"] = nil
+  write_status(job_id, data)
+  LOGGER.info "[vault] Closed job #{short_id(job_id)}"
+  data
 end
 
 # ---------------------------------------------------------------------------
@@ -209,10 +264,13 @@ def process_job(job_id)
       entry["pdfa_validation"] = pre_check
       data["completed_files"] += 1
       write_status(job_id, data)
+      LOGGER.info "[job #{short_id(job_id)}] #{filename}: already PDF/A-2b, skipped conversion"
       next
     end
 
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path)
+    elapsed = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(1)
 
     # Read fresh copy, update result
     data  = read_status(job_id)
@@ -224,12 +282,16 @@ def process_job(job_id)
       entry["error"]           = nil
       entry["pdfa_validation"] = run_verapdf(output_path, log_path)
       data["completed_files"] += 1
+      check = entry["pdfa_validation"] ? entry["pdfa_validation"]["result"] : "unchecked"
+      LOGGER.info "[job #{short_id(job_id)}] #{filename}: converted (exit #{exit_code}, #{elapsed}s, verapdf #{check})"
     else
       short_err = stderr.lines.last(5).join.strip
-      entry["status"] = "failed"
-      entry["error"]  = short_err
+      entry["status"]    = "failed"
+      entry["error"]     = short_err
+      entry["exit_code"] = exit_code
       data["completed_files"] += 1
       data["failed_files"]    += 1
+      LOGGER.warn "[job #{short_id(job_id)}] #{filename}: failed (exit #{exit_code}, #{elapsed}s)"
     end
 
     write_status(job_id, data)
@@ -264,16 +326,27 @@ def process_job(job_id)
       done_files.each { |f| FileUtils.rm_f(File.join(out_dir, f["name"])) }
     end
 
+    now = Time.now.utc
     data["status"]            = "complete"
     data["current_file"]      = nil
     data["download_ready"]    = true
     data["download_filename"] = download_filename
+    data["download_size"]     = File.size(File.join(out_dir, download_filename))
+    data["completed_at"]      = now.iso8601
+    data["expires_at"]        = (now + JOB_TTL_SECONDS).iso8601
     write_status(job_id, data)
   end
+  LOGGER.info "[job #{short_id(job_id)}] Finished: #{data["status"]} (#{done_files.size} done, #{data["failed_files"]} failed)"
 rescue => e
-  $stderr.puts "[job-error] #{e.class}: #{e.message}"
+  LOGGER.error "[job-error] #{short_id(job_id)} #{e.class}: #{e.message}\n  #{Array(e.backtrace).first(5).join("\n  ")}"
   begin
     data = read_status(job_id) || {}
+    # Don't leave records stuck at "processing"/"queued" under a failed job
+    Array(data["files"]).each do |f|
+      next unless %w[processing queued].include?(f["status"])
+      f["status"] = "failed"
+      f["error"]  = "Conversion stopped unexpectedly"
+    end
     data["status"]            = "failed"
     data["current_file"]      = nil
     data["download_ready"]    = false
@@ -338,6 +411,10 @@ post "/upload" do
   collected_names.each do |name|
     path = File.join(in_dir, name)
     if valid_pdf?(path)
+      # Uploads arrive 0600 (copied from Rack's tempfile); the verapdf container
+      # runs as a non-root user and can't read them, which silently disables the
+      # already-PDF/A pre-check. Outputs from ocrmypdf are 0644 already.
+      File.chmod(0o644, path)
       file_records << { "name" => name, "status" => "queued", "error" => nil }
     else
       FileUtils.rm_f(path)
@@ -368,12 +445,16 @@ post "/upload" do
     "failed_files"      => 0,
     "current_file"      => nil,
     "created_at"        => now.iso8601,
-    "expires_at"        => (now + JOB_TTL_SECONDS).iso8601,
+    "completed_at"      => nil,
+    "expires_at"        => nil,   # set when the job completes
+    "vault_closed"      => false,
     "files"             => file_records,
     "download_ready"    => false,
-    "download_filename" => nil
+    "download_filename" => nil,
+    "download_size"     => nil
   }
   write_status(job_id, initial_status)
+  LOGGER.info "[job #{short_id(job_id)}] Accepted: #{processable} queued, #{file_records.size - processable} rejected"
 
   Thread.new { process_job(job_id) }
 
@@ -388,11 +469,13 @@ get "/status/:job_id" do
     halt 400, { error: "Invalid job ID format." }.to_json
   end
 
-  path = status_path(job_id)
-  halt 404, { error: "Job not found." }.to_json unless File.exist?(path)
+  data = read_status(job_id)
+  halt 404, { error: "Job not found." }.to_json unless data
 
-  # Read and return the file directly — it is already valid JSON
-  File.read(path)
+  data = close_vault!(job_id, data) if data["status"] == "complete" && vault_closed?(data)
+
+  # server_time lets the client run the vault countdown without trusting its own clock
+  data.merge("server_time" => Time.now.utc.iso8601).to_json
 end
 
 get "/download/:job_id" do
@@ -401,12 +484,18 @@ get "/download/:job_id" do
     halt 400, "Invalid job ID format."
   end
 
+  status = read_status(job_id)
+  if status && vault_closed?(status)
+    close_vault!(job_id, status)
+    LOGGER.info "[download] Refused #{short_id(job_id)}: vault closed"
+    halt 410, "The vault is closed. These converted files were deleted from the server."
+  end
+
   out_dir = File.join(job_dir(job_id), "output")
   unless File.directory?(out_dir)
     halt 404, "This file is no longer available."
   end
 
-  status = read_status(job_id)
   unless status && status["download_ready"] && status["download_filename"]
     halt 404, "This file is no longer available."
   end
@@ -416,5 +505,6 @@ get "/download/:job_id" do
     halt 404, "This file is no longer available."
   end
 
+  LOGGER.info "[download] Served #{short_id(job_id)} (#{status["download_filename"]})"
   send_file file_path, filename: status["download_filename"], disposition: "attachment"
 end

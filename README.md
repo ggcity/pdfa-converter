@@ -1,6 +1,8 @@
-# PDF/A Converter
+# PDF LeGGacy (PDF/A Converter)
 
 A Ruby Sinatra web application that wraps [OCRmyPDF](https://ocrmypdf.readthedocs.io/) v17+ to perform batch PDF → PDF/A-2b conversion. Upload one or more PDFs (or a ZIP archive of PDFs), convert them to the archival PDF/A-2b format, and download the results.
+
+Part of the GG IT Toolbox family (launcher at https://toolbox.ggcity.org, `/leggacy`). Production runs at https://ch.ggcity.org/pdfa-converter. Unlike the other toolbox tools, which work entirely in the browser, this one **uploads files to the server**. They are deleted when the download window ("the vault") closes.
 
 Files that are **already PDF/A-2b conformant** are detected before conversion and passed through unchanged — skipping OCRmyPDF entirely for those files.
 
@@ -74,19 +76,51 @@ bundle exec ruby app.rb
 
 The app will start on `http://0.0.0.0:4567` by default.
 
-### Production (Puma)
+### Production (Passenger)
 
-```bash
-bundle exec puma config.ru -p 4567 -t 4:8
+Production is served by Phusion Passenger from `/var/www/rails/pdfa-converter`, mounted at the `/pdfa-converter` sub-path. Passenger picks up `config.ru` and sets `RACK_ENV=production` by default. In production the app runs OCRmyPDF from `/var/www/rails/pdfa-converter/.venv/bin/ocrmypdf`.
+
+Conversions run in a background `Thread` inside the Passenger worker process that accepted the upload. If Passenger shuts that process down (idle timeout, or a restart via `touch tmp/restart.txt` / deploy), any conversion in flight is killed and the job stays at "processing" forever. To reduce this:
+
+```nginx
+passenger_min_instances 1;
+passenger_pool_idle_time 3600;   # longer than the biggest expected batch
 ```
 
-Or use a `Procfile` / systemd unit pointing at `puma config.ru`.
+Avoid restarting the app while jobs are running.
+
+For a local production-like run you can still use Puma:
+
+```bash
+RACK_ENV=production bundle exec puma config.ru -p 4567 -t 4:8
+```
+
+### Logging
+
+- **Production** (`RACK_ENV=production`): request lines and job events are appended to `logs/app.log`.
+- **Everywhere else:** they go to stdout.
+
+Job IDs are logged as their first 8 characters only. The app doesn't rotate the log itself, because Ruby's `Logger` rotation isn't safe with several Passenger processes. Use logrotate with `copytruncate`:
+
+```
+/var/www/rails/pdfa-converter/logs/app.log {
+  weekly
+  rotate 8
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+```
+
+Per-file OCRmyPDF/verapdf output is still written to `tmp/jobs/<id>/logs/` and removed along with the job.
 
 ### Environment Variables
 
 | Variable        | Default | Description                         |
 |-----------------|---------|-------------------------------------|
 | `MAX_UPLOAD_MB` | `100`   | Maximum total upload size in MB     |
+| `RACK_ENV`      | —       | `production` switches logging to `logs/app.log` and uses the venv OCRmyPDF path |
 
 ---
 
@@ -98,7 +132,13 @@ The application performs a **boot-time cleanup** of job directories older than 6
 */10 * * * * find /path/to/app/tmp/jobs -mindepth 1 -maxdepth 1 -type d -mmin +60 -exec rm -rf {} +
 ```
 
-This removes job directories older than 60 minutes, running every 10 minutes. Files are available for download for up to 1 hour after job creation.
+This removes job directories older than 60 minutes, running every 10 minutes.
+
+**The vault.** Converted files can be downloaded for 1 hour after the job **completes** (`expires_at` in `status.json`). After that the vault is closed and enforced by the server:
+- `/download` returns `410 Gone` and deletes the output.
+- `/status` reports `vault_closed: true`.
+
+The cron job is the backstop that removes the whole job directory. Every status write bumps the directory's mtime, so its 60-minute age also counts from the last write.
 
 ---
 
@@ -108,8 +148,8 @@ This removes job directories older than 60 minutes, running every 10 minutes. Fi
 |--------|-----------------------|-----------------------------------------|
 | `GET`  | `/`                   | Upload page (main UI)                   |
 | `POST` | `/upload`             | Accepts file(s), starts conversion job  |
-| `GET`  | `/status/:job_id`     | JSON status of a conversion job         |
-| `GET`  | `/download/:job_id`   | Download converted file(s)              |
+| `GET`  | `/status/:job_id`     | JSON status of a conversion job (plus `server_time`) |
+| `GET`  | `/download/:job_id`   | Download converted file(s); `410` once the vault has closed |
 
 ---
 
@@ -158,9 +198,11 @@ ocrmypdf \
 ├── Gemfile
 ├── Gemfile.lock
 ├── public/
-│   └── style.css       # Minimal custom styles
+│   ├── style.css       # LeGGacy vault theme (light + dark tokens)
+│   └── logo.svg        # Shared toolbox favicon
 ├── views/
-│   └── index.erb       # Upload / progress / download UI
+│   └── index.erb       # Upload / progress / vault UI
+├── logs/               # app.log in production (git-ignored)
 ├── tmp/
 │   └── jobs/           # Job working directories (auto-cleaned)
 └── README.md

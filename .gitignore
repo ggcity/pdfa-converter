@@ -3,3 +3,4 @@ vendor/bundle/
 tmp/jobs/*/
 tmp/jobs/.gitkeep
 *.log
+logs/
