@@ -75,4 +75,4 @@ When the job finishes: if exactly one file converted, it is served as-is. If mor
 - Serve output only through `/download`, never as static files.
 - There is no authentication yet. The toolbox STAFF GATE and `recordsPreserved` stats reporting are deferred, because they need credentialed CORS for `https://ch.ggcity.org` in the toolbox's Cloud Function.
 
-**Cleanup:** At boot, job dirs older than 6 hours are deleted. Routine cleanup (older than 60 minutes) relies on an external cron job described in the README.
+**Cleanup:** At boot, job dirs older than 6 hours are deleted. Routine cleanup is `bin/cleanup-jobs`, a standalone stdlib-only Ruby script run from cron every 15 minutes (see the README). It deletes a complete job once its `expires_at` has passed, a failed job an hour after its last update, and a processing job or unreadable dir only after 6 hours. It uses `--dry-run` / `--jobs-dir` / `--log -` for testing. Keep its constants in step with `JOB_TTL_SECONDS` and `BOOT_CLEANUP_AGE`.

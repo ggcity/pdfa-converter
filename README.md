@@ -126,19 +126,34 @@ Per-file OCRmyPDF/verapdf output is still written to `tmp/jobs/<id>/logs/` and r
 
 ## Cron Job (Required for Cleanup)
 
-The application performs a **boot-time cleanup** of job directories older than 6 hours. For routine cleanup during normal operation, add the following cron entry (adjust the path):
+The app deletes job directories older than 6 hours when it starts. For routine cleanup, run `bin/cleanup-jobs` from cron. It reads each job's `status.json`:
+
+| Job state | Deleted when |
+|---|---|
+| `complete` | its vault has closed (`expires_at` has passed) |
+| `failed` | 1 hour after its last update |
+| `processing` | only when stuck: no update for 6 hours (for example a worker killed mid-conversion) |
+| no readable `status.json` | 6 hours old |
+
+It only touches directories named like a job ID, uses only the Ruby standard library (no Bundler), and logs what it deletes to `logs/app.log`, with shortened job IDs, when that directory exists.
+
+Install it in the `rails` user's crontab (`crontab -e` as `rails`). Use the same Ruby the app runs on; `which ruby` shows it:
 
 ```cron
-*/10 * * * * find /path/to/app/tmp/jobs -mindepth 1 -maxdepth 1 -type d -mmin +60 -exec rm -rf {} +
+*/15 * * * * /usr/bin/ruby /var/www/rails/pdfa-converter/bin/cleanup-jobs
 ```
 
-This removes job directories older than 60 minutes, running every 10 minutes.
+Check it by hand first. `--dry-run` reports what it would delete without deleting anything, and `--log -` prints to the terminal:
 
-**The vault.** Converted files can be downloaded for 1 hour after the job **completes** (`expires_at` in `status.json`). After that the vault is closed and enforced by the server:
+```bash
+/usr/bin/ruby /var/www/rails/pdfa-converter/bin/cleanup-jobs --dry-run --log -
+```
+
+If you used the old `find ... -mmin +60 -exec rm -rf` cron line, remove it: it could delete a job that is still converting.
+
+**The vault.** Converted files can be downloaded for 1 hour after the job **completes** (`expires_at` in `status.json`). The server enforces this itself, so the cron interval only affects disk space:
 - `/download` returns `410 Gone` and deletes the output.
 - `/status` reports `vault_closed: true`.
-
-The cron job is the backstop that removes the whole job directory. Every status write bumps the directory's mtime, so its 60-minute age also counts from the last write.
 
 ---
 

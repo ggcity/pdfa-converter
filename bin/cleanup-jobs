@@ -1,0 +1,123 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Deletes job directories under tmp/jobs that are no longer needed. Meant for
+# cron (every 15 minutes); the vault itself is already enforced by the app
+# (/download answers 410 after expires_at), so this only reclaims disk space.
+#
+#   complete    deleted once the vault has closed (expires_at has passed)
+#   failed      deleted FAILED_KEEP after its last status update
+#   processing  deleted only when stuck (no status update for STALE_AFTER)
+#   no/corrupt status.json   deleted after STALE_AFTER
+#
+# Usage: bin/cleanup-jobs [--dry-run] [--jobs-dir DIR] [--log FILE|-]
+#   Logs to logs/app.log when the logs/ directory exists (production),
+#   otherwise to stdout. "--log -" forces stdout.
+#
+# Uses only the Ruby standard library, so it runs without Bundler.
+
+require "json"
+require "time"
+require "fileutils"
+require "logger"
+require "optparse"
+
+APP_DIR     = File.expand_path("..", __dir__)
+FAILED_KEEP = 60 * 60        # failed jobs: the page has shown the errors; 1 hour is plenty
+STALE_AFTER = 6 * 60 * 60    # matches the app's boot cleanup (BOOT_CLEANUP_AGE)
+UUID_RE     = /\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/
+
+options = { dry_run: false, jobs_dir: File.join(APP_DIR, "tmp", "jobs"), log: nil }
+OptionParser.new do |o|
+  o.banner = "Usage: bin/cleanup-jobs [--dry-run] [--jobs-dir DIR] [--log FILE|-]"
+  o.on("--dry-run", "Report what would be deleted, delete nothing") { options[:dry_run] = true }
+  o.on("--jobs-dir DIR", "Job directory (default: tmp/jobs)") { |d| options[:jobs_dir] = File.expand_path(d) }
+  o.on("--log FILE", "Log file, or - for stdout") { |f| options[:log] = f }
+end.parse!
+
+log_target = options[:log] ||
+             (File.directory?(File.join(APP_DIR, "logs")) ? File.join(APP_DIR, "logs", "app.log") : "-")
+logger = if log_target == "-"
+  Logger.new($stdout)
+else
+  file = File.open(log_target, "a")
+  file.sync = true
+  Logger.new(file)
+end
+
+# Job IDs are download credentials: only ever log a prefix (same as the app).
+def short_id(id)
+  "#{id[0, 8]}…"
+end
+
+def read_status(dir)
+  JSON.parse(File.read(File.join(dir, "status.json"), encoding: "UTF-8"))
+rescue Errno::ENOENT, JSON::ParserError
+  nil
+end
+
+def dir_size(dir)
+  Dir.glob(File.join(dir, "**", "*"), File::FNM_DOTMATCH).sum { |f| File.file?(f) ? File.size(f) : 0 }
+end
+
+# Returns [delete?, reason]
+def verdict(dir, now)
+  status = read_status(dir)
+  age    = now - File.mtime(dir)   # every status.json write bumps the dir's mtime
+
+  if status.nil?
+    return [age > STALE_AFTER, "no readable status.json, #{(age / 3600).round(1)}h old"]
+  end
+
+  case status["status"]
+  when "complete"
+    expires = status["expires_at"] && (Time.parse(status["expires_at"]) rescue nil)
+    if expires.nil?
+      [age > STALE_AFTER, "complete without expires_at, #{(age / 3600).round(1)}h old"]
+    elsif now >= expires
+      [true, "vault closed #{((now - expires) / 60).round}m ago"]
+    else
+      [false, "vault open for #{((expires - now) / 60).round}m more"]
+    end
+  when "failed"
+    [age > FAILED_KEEP, "failed, last update #{(age / 60).round}m ago"]
+  else
+    [age > STALE_AFTER, "#{status["status"] || "unknown"}, last update #{(age / 3600).round(1)}h ago#{age > STALE_AFTER ? " (stuck)" : ""}"]
+  end
+end
+
+unless File.directory?(options[:jobs_dir])
+  logger.warn "[cleanup] jobs directory not found: #{options[:jobs_dir]}"
+  exit 1
+end
+
+now     = Time.now
+deleted = 0
+freed   = 0
+kept    = 0
+prefix  = options[:dry_run] ? "[cleanup] DRY RUN would delete" : "[cleanup] Deleted"
+
+Dir.children(options[:jobs_dir]).sort.each do |name|
+  dir = File.join(options[:jobs_dir], name)
+  next unless File.directory?(dir) && name.match?(UUID_RE)   # never touch anything else (.gitkeep etc.)
+
+  delete, reason = verdict(dir, now)
+  unless delete
+    kept += 1
+    next
+  end
+
+  size = dir_size(dir)
+  FileUtils.rm_rf(dir) unless options[:dry_run]
+  deleted += 1
+  freed   += size
+  logger.info "#{prefix} job #{short_id(name)} (#{reason}, #{(size / 1024.0 / 1024).round(1)} MB)"
+rescue SystemCallError => e
+  logger.error "[cleanup] Could not process job #{short_id(name)}: #{e.class}: #{e.message}"
+end
+
+if deleted.positive? || options[:dry_run]
+  verb = options[:dry_run] ? "would free" : "freed"
+  logger.info "[cleanup] #{deleted} job(s) #{options[:dry_run] ? "to delete" : "deleted"}, " \
+              "#{kept} kept, #{verb} #{(freed / 1024.0 / 1024).round(1)} MB"
+end
