@@ -11,8 +11,11 @@
 #   no/corrupt status.json   deleted after STALE_AFTER
 #
 # Usage: bin/cleanup-jobs [--dry-run] [--jobs-dir DIR] [--log FILE|-]
-#   Logs to logs/app.log when the logs/ directory exists (production),
-#   otherwise to stdout. "--log -" forces stdout.
+#   Logs to logs/app.log when the logs/ directory exists (production).
+#   "--log -" (or --dry-run) logs to stdout instead, for running by hand.
+#
+# Built for cron with MAILTO=: a normal run prints nothing at all. Errors are
+# logged AND written to stderr (so cron mails them), and the exit status is 1.
 #
 # Uses only the Ruby standard library, so it runs without Bundler.
 
@@ -35,14 +38,31 @@ OptionParser.new do |o|
   o.on("--log FILE", "Log file, or - for stdout") { |f| options[:log] = f }
 end.parse!
 
-log_target = options[:log] ||
-             (File.directory?(File.join(APP_DIR, "logs")) ? File.join(APP_DIR, "logs", "app.log") : "-")
+$errors = 0
+
+# Errors go to the log and to stderr: stderr is what cron mails.
+def report_error(logger, message)
+  message = message.gsub(/\h{8}-\h{4}-\h{4}-\h{4}-\h{12}/) { |id| short_id(id) }   # paths in errno messages
+  $errors += 1
+  logger.error(message)
+  $stderr.puts "cleanup-jobs: #{message}"
+end
+
+default_log = File.join(APP_DIR, "logs", "app.log")
+log_target  = options[:log] || (options[:dry_run] ? "-" : default_log)
 logger = if log_target == "-"
   Logger.new($stdout)
+elsif log_target == default_log && !File.directory?(File.dirname(default_log))
+  Logger.new(File::NULL)   # no logs/ (e.g. dev): stay silent, only errors reach stderr
 else
-  file = File.open(log_target, "a")
-  file.sync = true
-  Logger.new(file)
+  begin
+    file = File.open(log_target, "a")
+    file.sync = true
+    Logger.new(file)
+  rescue SystemCallError => e
+    $stderr.puts "cleanup-jobs: cannot open log #{log_target}: #{e.message}"
+    exit 1
+  end
 end
 
 # Job IDs are download credentials: only ever log a prefix (same as the app).
@@ -87,7 +107,7 @@ def verdict(dir, now)
 end
 
 unless File.directory?(options[:jobs_dir])
-  logger.warn "[cleanup] jobs directory not found: #{options[:jobs_dir]}"
+  report_error(logger, "[cleanup] jobs directory not found: #{options[:jobs_dir]}")
   exit 1
 end
 
@@ -97,7 +117,14 @@ freed   = 0
 kept    = 0
 prefix  = options[:dry_run] ? "[cleanup] DRY RUN would delete" : "[cleanup] Deleted"
 
-Dir.children(options[:jobs_dir]).sort.each do |name|
+begin
+  names = Dir.children(options[:jobs_dir]).sort
+rescue SystemCallError => e
+  report_error(logger, "[cleanup] Cannot read #{options[:jobs_dir]}: #{e.class}: #{e.message}")
+  exit 1
+end
+
+names.each do |name|
   dir = File.join(options[:jobs_dir], name)
   next unless File.directory?(dir) && name.match?(UUID_RE)   # never touch anything else (.gitkeep etc.)
 
@@ -108,12 +135,13 @@ Dir.children(options[:jobs_dir]).sort.each do |name|
   end
 
   size = dir_size(dir)
-  FileUtils.rm_rf(dir) unless options[:dry_run]
+  # rm_r, not rm_rf: rm_rf swallows errors, so a failed delete would be logged as done
+  FileUtils.rm_r(dir, secure: true) unless options[:dry_run]
   deleted += 1
   freed   += size
   logger.info "#{prefix} job #{short_id(name)} (#{reason}, #{(size / 1024.0 / 1024).round(1)} MB)"
-rescue SystemCallError => e
-  logger.error "[cleanup] Could not process job #{short_id(name)}: #{e.class}: #{e.message}"
+rescue StandardError => e
+  report_error(logger, "[cleanup] Could not process job #{short_id(name)}: #{e.class}: #{e.message}")
 end
 
 if deleted.positive? || options[:dry_run]
@@ -121,3 +149,5 @@ if deleted.positive? || options[:dry_run]
   logger.info "[cleanup] #{deleted} job(s) #{options[:dry_run] ? "to delete" : "deleted"}, " \
               "#{kept} kept, #{verb} #{(freed / 1024.0 / 1024).round(1)} MB"
 end
+
+exit($errors.zero? ? 0 : 1)

@@ -140,8 +140,11 @@ It only touches directories named like a job ID, uses only the Ruby standard lib
 Install it in the `rails` user's crontab (`crontab -e` as `rails`). Use the same Ruby the app runs on; `which ruby` shows it:
 
 ```cron
+MAILTO=you@ggcity.org
 */15 * * * * /usr/bin/ruby /var/www/rails/pdfa-converter/bin/cleanup-jobs
 ```
+
+It prints nothing on a normal run, so cron only sends mail when something is wrong. Errors are written to stderr (and to `app.log`), and the script exits with status 1. Examples are an unreadable or missing jobs directory, or a job directory it can't delete. Job IDs in error messages are shortened.
 
 Check it by hand first. `--dry-run` reports what it would delete without deleting anything, and `--log -` prints to the terminal:
 
