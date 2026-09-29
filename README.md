@@ -27,7 +27,11 @@ Used for two purposes:
 1. **Pre-conversion check** — before running OCRmyPDF, verapdf inspects the input file. If it is already PDF/A-2b conformant the file is passed through unchanged and OCRmyPDF is skipped.
 2. **Post-conversion validation** — after a successful conversion, verapdf verifies that the output meets PDF/A-2b requirements. The result is included in the job status response.
 
-verapdf runs via the `verapdf/cli` Podman image — no local installation required. If Podman is not available (or the image is not pulled), both checks are silently skipped and conversion proceeds normally.
+verapdf runs from the `verapdf/cli` Podman image, so it needs no local installation.
+- Each worker checks once, at startup, whether podman and the image are available. The boot line in `app.log` reports the result.
+- If either is missing, both checks are skipped and conversion proceeds normally. Results then show as "not checked".
+- The app never downloads the image during a conversion (`--pull=never`). Pull it as the app user (`podman pull verapdf/cli` as `rails`), then restart the app.
+- If verapdf runs but produces no result, that is logged as a warning with its error output.
 
 ```bash
 podman pull verapdf/cli

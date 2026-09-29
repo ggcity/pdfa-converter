@@ -292,7 +292,13 @@ def job_log_hint(job_id, filename)
 end
 
 def verapdf_label(result)
-  return "unavailable (podman/image missing or file unreadable)" unless result
+  unless result
+    return case verapdf_availability
+           when :no_podman     then "skipped (podman not installed)"
+           when :image_missing then "skipped (#{VERAPDF_IMAGE} image not pulled)"
+           else "no result (see the verapdf warning above)"
+           end
+  end
   return "pass (PDF/A-#{result["profile"]})" if result["result"] == "pass"
   "fail: #{result["details"]}"
 end
@@ -351,6 +357,35 @@ rescue SystemCallError => e
   [nil, "could not run #{OCRMYPDF_PYTHON}: #{e.message}"]
 end
 
+# verapdf runs from the verapdf/cli container via podman. It's optional: without
+# it the pass-through pre-check is skipped and results show as "not checked".
+VERAPDF_IMAGE = "verapdf/cli"
+
+# Checked once per worker (the result is cached), so a missing podman or image
+# costs nothing per file. Installing or pulling it later needs an app restart.
+# (A constant, not an @ivar: conversions run in threads started from request
+# objects, so an ivar would be cached per request instead of per worker.)
+VERAPDF_CHECK = { mutex: Mutex.new, result: nil }
+def verapdf_availability
+  VERAPDF_CHECK[:mutex].synchronize do
+    VERAPDF_CHECK[:result] ||= begin
+      _out, st = Open3.capture2e("podman", "image", "exists", VERAPDF_IMAGE)
+      st.success? ? :available : :image_missing
+    rescue SystemCallError
+      :no_podman
+    end
+  end
+end
+
+def verapdf_boot_status(version, which)
+  case verapdf_availability
+  when :no_podman     then "disabled: podman not found on PATH (pre-check skipped, results \"not checked\")"
+  when :image_missing then "disabled: #{version.call("podman", "--version")} (#{which.call("podman")}), " \
+                           "but image #{VERAPDF_IMAGE} not pulled; run `podman pull #{VERAPDF_IMAGE}` as this user, then restart"
+  else "#{version.call("podman", "--version")} (#{which.call("podman")}), image #{VERAPDF_IMAGE} present"
+  end
+end
+
 # Record which tool versions this worker uses (in the background: --version is slow).
 # Ghostscript does the PDF/A step (--pdfa-image-compression rules out OCRmyPDF's
 # pikepdf-only route), so its version and path matter most when dev and prod differ.
@@ -376,6 +411,7 @@ Thread.new do
               "    #{pylibs}\n" \
               "    ghostscript #{version.call("gs", "--version")} (#{which.call("gs")})\n" \
               "    #{version.call("tesseract", "--version")} (#{which.call("tesseract")})\n" \
+              "    verapdf     #{verapdf_boot_status(version, which)}\n" \
               "    PATH=#{ENV["PATH"]}"
 end
 
@@ -417,37 +453,43 @@ ensure
   FileUtils.rm_f(scratch) if scratch
 end
 
-# Run verapdf via podman to verify PDF/A conformance.
+
+# Run verapdf to verify PDF/A conformance.
 # Returns { "result" => "pass", "profile" => "2b" },
 #         { "result" => "fail", "details" => "..." },
-#      or nil if podman / the image is unavailable (skip silently).
-def run_verapdf(output_path, log_path)
-  dir      = File.dirname(output_path)
-  filename = File.basename(output_path)
+#      or nil when verapdf is unavailable or produced no verdict (logged).
+def run_verapdf(pdf_path, log_path, tag: nil)
+  return nil unless verapdf_availability == :available
+
+  dir      = File.dirname(pdf_path)
+  filename = File.basename(pdf_path)
 
   cmd = [
-    "podman", "run", "--rm",
+    "podman", "run", "--rm", "--pull=never",   # never download the image mid-conversion
     "-v", "#{dir}:/data:ro",
-    "verapdf/cli",
+    VERAPDF_IMAGE,
     "--format", "text",
     "/data/#{filename}"
   ]
 
-  stdout, stderr, _status = Open3.capture3(*cmd)
+  stdout, stderr, status = Open3.capture3(*cmd)
   stdout, stderr = utf8(stdout), utf8(stderr)
-  File.open(log_path, "a") { |f| f.write("\n\nVERAPDF:\n#{stdout}#{stderr}") }
+  File.open(log_path, "a") { |f| f.write("\n\nVERAPDF #{filename} (exit #{status.exitstatus}):\n#{stdout}#{stderr}") }
 
   first_line = stdout.lines.first.to_s.strip
   if first_line.start_with?("PASS")
-    profile = first_line.split[2]   # e.g. "2b"
-    { "result" => "pass", "profile" => profile }
+    { "result" => "pass", "profile" => first_line.split[2] }   # e.g. "2b"
   elsif first_line.empty?
-    nil   # podman/image unavailable: skip silently
+    # verapdf is installed but gave no verdict: an error, not "not installed"
+    LOGGER.warn "#{tag || filename}: verapdf ran but gave no result (podman exit #{status.exitstatus}); it said:\n" \
+                "#{stderr_digest(stderr)}"
+    nil
   else
     { "result" => "fail", "details" => first_line }
   end
-rescue Errno::ENOENT
-  nil   # podman not on PATH: skip silently
+rescue SystemCallError => e
+  LOGGER.warn "#{tag || File.basename(pdf_path)}: could not run verapdf: #{e.class}: #{e.message}"
+  nil
 end
 
 # ---------------------------------------------------------------------------
@@ -481,7 +523,7 @@ def process_job(job_id)
     LOGGER.info "#{tag}: starting (#{describe_pdf(input_path)})"
 
     # Skip conversion if the file is already PDF/A-2b conformant
-    pre_check = run_verapdf(input_path, log_path)
+    pre_check = run_verapdf(input_path, log_path, tag: tag)
     LOGGER.info "#{tag}: verapdf pre-check #{verapdf_label(pre_check)}"
     if pre_check && pre_check["result"] == "pass" && pre_check["profile"] == "2b"
       FileUtils.cp(input_path, output_path)
@@ -550,7 +592,7 @@ def process_job(job_id)
       entry["forced_image"]    = forced
       entry["docinfo_simplified"] = !docinfo_changes.nil?
       entry["signature_invalidated"] = !extra_flags.empty?
-      entry["pdfa_validation"] = run_verapdf(output_path, log_path)
+      entry["pdfa_validation"] = run_verapdf(output_path, log_path, tag: tag)
       data["completed_files"] += 1
       how = if forced then "forced as page images"
             elsif docinfo_changes then "normal, with plain-ASCII document info"
