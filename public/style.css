@@ -337,6 +337,19 @@ body {
 .notice .label { color: var(--error); white-space: nowrap; }
 .notice-body { font-size: 13px; color: var(--text-body); flex: 1; min-width: 200px; overflow-wrap: anywhere; }
 
+/* ── ARCHIVAL FORMAT CHOICE ── */
+.level-opt { border: 0; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.level-legend {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 700; font-size: 14px; letter-spacing: 2px; text-transform: uppercase;
+  color: var(--text-primary);
+  padding: 0; margin-bottom: 2px;
+}
+.level-label { display: flex; align-items: flex-start; gap: 10px; font-size: 13px; line-height: 1.5; color: var(--text-body); cursor: pointer; }
+.level-label strong { color: var(--text-primary); }
+.level-label input { width: 16px; height: 16px; margin-top: 2px; flex-shrink: 0; accent-color: var(--navy-mid); cursor: pointer; }
+.level-label input:focus-visible { outline: 2px solid var(--flame-yellow); outline-offset: 2px; }
+
 /* ── FORCE ARCHIVAL OPT-IN ── */
 .force-opt { display: flex; flex-direction: column; gap: 8px; }
 .force-label {

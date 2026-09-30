@@ -147,6 +147,20 @@
       <ul id="file-list" class="file-list"></ul>
     </div>
 
+    <fieldset class="level-opt">
+      <legend class="level-legend">Archival format</legend>
+      <label class="level-label">
+        <input type="radio" name="pdfa-level" value="1b" checked>
+        <span><strong>PDF/A-1b</strong> (default): the version named by California's
+        records regulations for scanned official records (2 CCR 22620.8).</span>
+      </label>
+      <label class="level-label">
+        <input type="radio" name="pdfa-level" value="2b">
+        <span><strong>PDF/A-2b</strong>: newer; allows transparency, layers and JPEG 2000,
+        so more born-digital files convert without changes. Not the version the regulation names.</span>
+      </label>
+    </fieldset>
+
     <div class="force-opt">
       <label class="force-label">
         <input type="checkbox" id="force-image" aria-describedby="force-explain">
@@ -412,6 +426,8 @@ async function startConversion() {
   const formData = new FormData();
   selectedFiles.forEach((f) => formData.append("files[]", f, f.name));
   if (forceImage.checked) formData.append("force_image", "1");
+  const level = document.querySelector('input[name="pdfa-level"]:checked');
+  formData.append("pdfa_level", level ? level.value : "1b");
 
   // One thing on screen at a time
   hide(uploadSection);

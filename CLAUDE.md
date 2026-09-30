@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**PDF LeGGacy** is a single-file Sinatra app (`app.rb`, classic style) that wraps OCRmyPDF (v17+) to batch-convert uploaded PDFs, or ZIPs of PDFs, to PDF/A-2b. It belongs to the GG IT Toolbox family. The toolbox is a separate Firebase repo at `/var/www/firebase/gg-toolbox`; its launcher tile and `/leggacy` redirect point here.
+**PDF LeGGacy** is a single-file Sinatra app (`app.rb`, classic style) that wraps OCRmyPDF (v17+) to batch-convert uploaded PDFs, or ZIPs of PDFs, to PDF/A-1b by default, or PDF/A-2b if chosen on the upload page. It belongs to the GG IT Toolbox family. The toolbox is a separate Firebase repo at `/var/www/firebase/gg-toolbox`; its launcher tile and `/leggacy` redirect point here.
 
 - **Production:** Phusion Passenger at `https://ch.ggcity.org/pdfa-converter`, with `RACK_ENV=production`.
 - **Frontend:** `views/index.erb` (plain HTML with vanilla JS, no framework) plus `public/style.css`.
@@ -34,8 +34,10 @@ External tools that must be on the host: `ocrmypdf`, Ghostscript, and Tesseract.
 
 Always change `status.json` through `read_status`/`write_status`. `write_status` writes to a temp file and renames it so the change is atomic. `process_job` re-reads the status before each update instead of keeping a copy in memory. Keep doing both.
 
+**Archival level:** each job has a `pdfa_level`, either "1b" (the default, `DEFAULT_PDFA_LEVEL`) or "2b", chosen with radio buttons on the upload page and mapped to OCRmyPDF's `--output-type pdfa-1` or `pdfa-2` (`PDFA_LEVELS`, `ocrmypdf_flags`). 1b is the default because it's the PDF/A version (ISO 19005-1) named by California's trusted-system regulations for converted records (2 CCR 22620.8). `OCRMYPDF_FLAGS` deliberately leaves out `--output-type`.
+
 **What happens to each file in `process_job`:**
-1. **verapdf pre-check.** If the input already passes PDF/A-2b, it is copied to `output/` unchanged and marked `skipped: true`.
+1. **verapdf pre-check.** If the input already passes the job's level, it is copied to `output/` unchanged and marked `skipped: true`. verapdf checks the level a file claims, so a valid 2b file in a 1b job gets converted.
 2. **Otherwise, run `ocrmypdf` with `OCRMYPDF_FLAGS`.** Exit codes 0 and 6 both count as success; 6 means the file already has text (`--skip-text`). On failure, the leftover output is deleted, and the file gets `exit_code` and `exit_name`, plus `error`, which holds OCRmyPDF's actual error lines (`stderr_highlights`). The UI shows these verbatim; don't simplify them into plain-language messages.
    - **Digital signature retry (automatic, runs first):** exit 2 with `DigitalSignatureError` is retried with `--invalidate-digital-signatures`. That flag is also carried into any later retries. Any conversion alters the file, so the archival copy isn't validly signed. The file gets `signature_invalidated: true`, and the UI's Needs attention section says to keep the signed original.
    - **Plain document info retry (automatic):** on exit 10, `plain_docinfo_copy` uses the venv's pikepdf (`OCRMYPDF_PYTHON`) to write a copy in `work/` whose DOCINFO text (title, author, and so on) is plain ASCII, then retries normally. Production's Ghostscript 9.54 discards non-ASCII DOCINFO (for example an en dash in `/Title`), and the PDF/A marker goes with it ("No PDF/A metadata in XMP"). Page content is untouched. Success sets `docinfo_simplified: true`, and the changes are logged.

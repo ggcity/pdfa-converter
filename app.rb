@@ -202,8 +202,14 @@ else
   "ocrmypdf"
 end
 
+# Archival level per job, chosen on the upload page. 1b is the default: it is the
+# PDF/A version (ISO 19005-1, PDF/A-1) named by California's trusted-system
+# regulations for converted records (2 CCR 22620.8). 2b is offered as an option.
+PDFA_LEVELS        = { "1b" => "pdfa-1", "2b" => "pdfa-2" }.freeze   # level => ocrmypdf --output-type
+DEFAULT_PDFA_LEVEL = "1b"
+
+# Everything except --output-type, which comes from the job's level.
 OCRMYPDF_FLAGS = %w[
-  --output-type pdfa-2
   --rasterizer auto
   --skip-text
   --optimize 1
@@ -308,6 +314,10 @@ end
 # conversion ends in EXIT_PDFA_FAILED. (--force-ocr and --skip-text are exclusive.)
 OCRMYPDF_FORCE_FLAGS = OCRMYPDF_FLAGS.map { |f| f == "--skip-text" ? "--force-ocr" : f }.freeze
 EXIT_PDFA_FAILED     = 10   # output is a valid PDF, but not PDF/A
+
+def ocrmypdf_flags(level, force: false)
+  ["--output-type", PDFA_LEVELS.fetch(level), *(force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS)]
+end
 
 # The Python that runs ocrmypdf (the venv's in production), so pikepdf is available.
 OCRMYPDF_PYTHON = if ENV["RACK_ENV"] == "production"
@@ -415,8 +425,8 @@ Thread.new do
               "    PATH=#{ENV["PATH"]}"
 end
 
-def run_ocrmypdf(input_path, output_path, log_path, force: false, extra: [])
-  flags = (force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS) + extra
+def run_ocrmypdf(input_path, output_path, log_path, level:, force: false, extra: [])
+  flags = ocrmypdf_flags(level, force: force) + extra
   cmd = [OCRMYPDF_CMD, *flags, input_path, output_path]
   stdout, stderr, status = Open3.capture3(*cmd)
   stdout, stderr = utf8(stdout), utf8(stderr)
@@ -436,10 +446,10 @@ GS_DIAG_RE = %r{GPL\sGhostscript|\*{4}|error|warning|pdfa|pdf/a|docinfo|xmp|
 # -v1 debug lines that only matched because a file path contains "pdfa"
 DIAG_NOISE_RE = %r{\ARunning:\s\[|\Aos\.\w+\(|\A/\S+\s->\s/}
 
-def ghostscript_diagnostics(input_path, work_dir, log_path, force:, extra:)
+def ghostscript_diagnostics(input_path, work_dir, log_path, level:, force:, extra:)
   FileUtils.mkdir_p(work_dir)
   scratch = File.join(work_dir, "diagnostic-#{File.basename(input_path)}")
-  flags   = (force ? OCRMYPDF_FORCE_FLAGS : OCRMYPDF_FLAGS) + extra + ["-v", "1"]
+  flags   = ocrmypdf_flags(level, force: force) + extra + ["-v", "1"]
   _out, err, _st = Open3.capture3(OCRMYPDF_CMD, *flags, input_path, scratch)
   err = utf8(err)
   File.open(log_path, "a") { |f| f.write("\n\nDIAGNOSTIC OCRMYPDF #{flags.join(" ")}\nSTDERR:\n#{err}\n") }
@@ -455,7 +465,7 @@ end
 
 
 # Run verapdf to verify PDF/A conformance.
-# Returns { "result" => "pass", "profile" => "2b" },
+# Returns { "result" => "pass", "profile" => "1b" },
 #         { "result" => "fail", "details" => "..." },
 #      or nil when verapdf is unavailable or produced no verdict (logged).
 def run_verapdf(pdf_path, log_path, tag: nil)
@@ -478,7 +488,7 @@ def run_verapdf(pdf_path, log_path, tag: nil)
 
   first_line = stdout.lines.first.to_s.strip
   if first_line.start_with?("PASS")
-    { "result" => "pass", "profile" => first_line.split[2] }   # e.g. "2b"
+    { "result" => "pass", "profile" => first_line.split[2] }   # e.g. "1b"
   elsif first_line.empty?
     # verapdf is installed but gave no verdict: an error, not "not installed"
     LOGGER.warn "#{tag || filename}: verapdf ran but gave no result (podman exit #{status.exitstatus}); it said:\n" \
@@ -504,6 +514,7 @@ def process_job(job_id)
 
   job_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   initial = read_status(job_id)
+  level   = PDFA_LEVELS.key?(initial["pdfa_level"]) ? initial["pdfa_level"] : DEFAULT_PDFA_LEVEL
   # Only process files that are queued (not rejected)
   filenames = initial["files"].reject { |f| f["status"] == "rejected" }.map { |f| f["name"] }
 
@@ -522,10 +533,12 @@ def process_job(job_id)
     tag = "[job #{short_id(job_id)}] #{filename}"
     LOGGER.info "#{tag}: starting (#{describe_pdf(input_path)})"
 
-    # Skip conversion if the file is already PDF/A-2b conformant
+    # Skip conversion if the file already conforms to the job's level. (verapdf
+    # checks the level a file claims, so a valid 2b file isn't passed through
+    # for a 1b job: it's converted.)
     pre_check = run_verapdf(input_path, log_path, tag: tag)
     LOGGER.info "#{tag}: verapdf pre-check #{verapdf_label(pre_check)}"
-    if pre_check && pre_check["result"] == "pass" && pre_check["profile"] == "2b"
+    if pre_check && pre_check["result"] == "pass" && pre_check["profile"] == level
       FileUtils.cp(input_path, output_path)
       data  = read_status(job_id)
       entry = data["files"].find { |f| f["name"] == filename }
@@ -535,13 +548,13 @@ def process_job(job_id)
       entry["pdfa_validation"] = pre_check
       data["completed_files"] += 1
       write_status(job_id, data)
-      LOGGER.info "#{tag}: already PDF/A-2b, passed through unchanged"
+      LOGGER.info "#{tag}: already PDF/A-#{level}, passed through unchanged"
       next
     end
 
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    LOGGER.info "#{tag}: running ocrmypdf #{OCRMYPDF_FLAGS.join(" ")}"
-    exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path)
+    LOGGER.info "#{tag}: running ocrmypdf #{ocrmypdf_flags(level).join(" ")}"
+    exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, level: level)
     forced          = false
     docinfo_changes = nil
     retry_input     = input_path
@@ -553,7 +566,7 @@ def process_job(job_id)
       LOGGER.warn "#{tag}: input has a digital signature; retrying with --invalidate-digital-signatures " \
                   "(the archival copy will NOT carry a valid signature; keep the signed original)"
       extra_flags = ["--invalidate-digital-signatures"]
-      exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, extra: extra_flags)
+      exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, level: level, extra: extra_flags)
     end
 
     # Retry 1 (automatic, content untouched): plain-ASCII document info
@@ -562,7 +575,7 @@ def process_job(job_id)
       plain_path, note = plain_docinfo_copy(input_path, File.join(job_dir(job_id), "work"))
       if plain_path
         LOGGER.info "#{tag}: retrying with plain-ASCII document info:\n#{note.lines.map { |l| "    | #{l.rstrip}" }.join("\n")}"
-        exit_code, stderr = run_ocrmypdf(plain_path, output_path, log_path, extra: extra_flags)
+        exit_code, stderr = run_ocrmypdf(plain_path, output_path, log_path, level: level, extra: extra_flags)
         docinfo_changes = note
         retry_input     = plain_path
         if exit_code == EXIT_PDFA_FAILED
@@ -575,8 +588,8 @@ def process_job(job_id)
 
     # Retry 2 (last resort, only when the user opted in): pages as images
     if exit_code == EXIT_PDFA_FAILED && initial["force_image"]
-      LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{(OCRMYPDF_FORCE_FLAGS + extra_flags).join(" ")}"
-      exit_code, stderr = run_ocrmypdf(retry_input, output_path, log_path, force: true, extra: extra_flags)
+      LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{(ocrmypdf_flags(level, force: true) + extra_flags).join(" ")}"
+      exit_code, stderr = run_ocrmypdf(retry_input, output_path, log_path, level: level, force: true, extra: extra_flags)
       forced = true
     end
     elapsed = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(1)
@@ -622,7 +635,7 @@ def process_job(job_id)
       LOGGER.warn "#{tag}: FAILED in #{elapsed}s, exit #{exit_label(exit_code)} (#{context}); ocrmypdf said:\n" \
                   "#{stderr_digest(stderr)}\n    #{job_log_hint(job_id, filename)}"
       if exit_code == EXIT_PDFA_FAILED
-        gs_lines = ghostscript_diagnostics(retry_input, File.join(job_dir(job_id), "work"), log_path,
+        gs_lines = ghostscript_diagnostics(retry_input, File.join(job_dir(job_id), "work"), log_path, level: level,
                                            force: forced, extra: extra_flags)
         body = gs_lines.empty? ? "    | (no Ghostscript messages)" : gs_lines.map { |l| "    | #{l}" }.join("\n")
         LOGGER.warn "#{tag}: Ghostscript diagnostics (ocrmypdf -v 1 rerun of the last attempt):\n#{body}"
@@ -779,6 +792,7 @@ post "/upload" do
     "job_id"            => job_id,
     "status"            => "processing",
     "force_image"       => params[:force_image] == "1",
+    "pdfa_level"        => PDFA_LEVELS.key?(params[:pdfa_level]) ? params[:pdfa_level] : DEFAULT_PDFA_LEVEL,
     "total_files"       => processable,
     "completed_files"   => 0,
     "failed_files"      => 0,
@@ -798,7 +812,8 @@ post "/upload" do
   end
   listing << "… #{file_records.size - 10} more" if file_records.size > 10
   LOGGER.info "[job #{short_id(job_id)}] Accepted from #{request.ip}: #{processable} queued, " \
-              "#{file_records.size - processable} rejected, force archival #{initial_status["force_image"] ? "ON" : "off"}\n" \
+              "#{file_records.size - processable} rejected, PDF/A-#{initial_status["pdfa_level"]}, " \
+              "force archival #{initial_status["force_image"] ? "ON" : "off"}\n" \
               "#{listing.map { |l| "    - #{l}" }.join("\n")}"
 
   Thread.new { process_job(job_id) }

@@ -1,10 +1,14 @@
 # PDF LeGGacy (PDF/A Converter)
 
-A Ruby Sinatra web application that wraps [OCRmyPDF](https://ocrmypdf.readthedocs.io/) v17+ to perform batch PDF → PDF/A-2b conversion. Upload one or more PDFs (or a ZIP archive of PDFs), convert them to the archival PDF/A-2b format, and download the results.
+A Ruby Sinatra web application that wraps [OCRmyPDF](https://ocrmypdf.readthedocs.io/) v17+ to perform batch PDF → PDF/A conversion. Upload one or more PDFs (or a ZIP archive of PDFs), convert them to an archival PDF/A format, and download the results.
+
+**Archival format:** each upload chooses between two formats.
+- **PDF/A-1b** (the default) is the version named by California's trusted-system regulations for converted records ([2 CCR § 22620.8](https://www.law.cornell.edu/regulations/california/2-CCR-22620.8), ISO 19005-1). It's stricter: transparency, layers and JPEG 2000 aren't allowed, so more born-digital files fail it.
+- **PDF/A-2b** can be chosen on the upload page instead.
 
 Part of the GG IT Toolbox family (launcher at https://toolbox.ggcity.org, `/leggacy`). Production runs at https://ch.ggcity.org/pdfa-converter. Unlike the other toolbox tools, which work entirely in the browser, this one **uploads files to the server**. They are deleted when the download window ("the vault") closes.
 
-Files that are **already PDF/A-2b conformant** are detected before conversion and passed through unchanged — skipping OCRmyPDF entirely for those files.
+Files that **already conform to the chosen format** are detected before conversion and passed through unchanged — skipping OCRmyPDF entirely for those files.
 
 ---
 
@@ -24,8 +28,8 @@ pip install pypdfium2
 
 Used for two purposes:
 
-1. **Pre-conversion check** — before running OCRmyPDF, verapdf inspects the input file. If it is already PDF/A-2b conformant the file is passed through unchanged and OCRmyPDF is skipped.
-2. **Post-conversion validation** — after a successful conversion, verapdf verifies that the output meets PDF/A-2b requirements. The result is included in the job status response.
+1. **Pre-conversion check** — before running OCRmyPDF, verapdf inspects the input file. If it already conforms to the chosen format (1b or 2b) the file is passed through unchanged and OCRmyPDF is skipped.
+2. **Post-conversion validation** — after a successful conversion, verapdf verifies that the output meets the requirements of the PDF/A level it claims. The result is included in the job status response.
 
 verapdf runs from the `verapdf/cli` Podman image, so it needs no local installation.
 - Each worker checks once, at startup, whether podman and the image are available. The boot line in `app.log` reports the result.
@@ -179,7 +183,7 @@ If you used the old `find ... -mmin +60 -exec rm -rf` cron line, remove it: it c
 
 ```
 ocrmypdf \
-  --output-type pdfa-2 \
+  --output-type pdfa-1 \          # or pdfa-2 when PDF/A-2b is chosen
   --rasterizer auto \
   --skip-text \
   --optimize 1 \
@@ -189,7 +193,7 @@ ocrmypdf \
   input.pdf output.pdf
 ```
 
-- `--output-type pdfa-2` — targets PDF/A-2b output via Ghostscript
+- `--output-type pdfa-1` / `pdfa-2`: targets PDF/A-1b (default) or PDF/A-2b via Ghostscript
 - `--rasterizer auto` — uses pypdfium2 when available, falls back to pdftoppm
 - `--skip-text` — preserves existing text layers; skips pages that already have extractable text
 - `--optimize 1` — lossless optimizations only
