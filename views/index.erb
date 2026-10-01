@@ -523,7 +523,7 @@ function recordBadge(f) {
     return `<span class="stamp stamp--pass">Archival · ${escHtml(profile)}${how}</span>`;
   }
   if (kind === "warn") {
-    return f.pdfa_validation
+    return f.pdfa_validation && f.pdfa_validation.result === "fail"
       ? `<span class="stamp stamp--warn">Converted · check failed</span>`
       : `<span class="stamp stamp--warn">Converted · not checked</span>`;
   }
@@ -653,10 +653,17 @@ function showCompletion(job) {
   // Needs attention: failures first, then records that converted but aren't verified archival
   attentionList.innerHTML = "";
   fail.forEach((f) => addAttention(f.name, errorBlock(f)));
-  warn.forEach((f) => addAttention(f.name, noteBlock(
-    f.pdfa_validation
-      ? `Included, but failed the PDF/A check. verapdf: ${f.pdfa_validation.details || f.pdfa_validation.result}`
-      : "Included, but not checked: verapdf did not run (podman or the verapdf/cli image is unavailable)"
+  warn.forEach((f) => {
+    const v = f.pdfa_validation;
+    let note;
+    if (!v) note = "Included, but not checked: verapdf did not run (podman or the verapdf/cli image is unavailable)";
+    else if (v.result === "error") note = `Included, but not checked: verapdf could not give a verdict. ${v.details}`;
+    else note = `Included, but failed the PDF/A check. verapdf: ${v.details || v.result}`;
+    addAttention(f.name, noteBlock(note));
+  });
+  // Flattened forms look the same but no longer work as forms
+  files.filter((f) => f.status === "done" && f.form_flattened).forEach((f) => addAttention(f.name, noteBlock(
+    "Form fields and annotations were flattened into the page so it could be converted. They look the same, but the form is no longer fillable."
   )));
   // Signed PDFs can only be converted by invalidating the signature
   files.filter((f) => f.status === "done" && f.signature_invalidated).forEach((f) => addAttention(f.name, noteBlock(

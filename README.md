@@ -216,19 +216,19 @@ When a file still fails the PDF/A step after every retry, the app runs one extra
 
 RHEL 9 ships Ghostscript 9.54.0 (2021), which fails PDF/A conversion on some files that newer versions handle. You can build a newer one into the app directory without touching the system package. If `vendor/ghostscript/bin/gs` exists, the app puts that directory first on PATH at startup, so OCRmyPDF uses it. The boot line in `app.log` shows which `gs` each worker picked up.
 
-Use **10.05.1**. OCRmyPDF warns that 10.6.0 and later have JPEG encoding bugs. Get the GPL Ghostscript source tarball (`ghostscript-10.05.1.tar.gz`, not the `ghostpdl` or `gs` binary packages) from https://github.com/ArtifexSoftware/ghostpdl-downloads/releases (tag `gs10051`). It bundles its own zlib, libpng, libjpeg, lcms2, freetype, openjpeg and jbig2dec, so it only needs a compiler:
+Production runs **10.08**. (OCRmyPDF 17.6 in dev warns that Ghostscript 10.6.0 and later have JPEG encoding bugs. Production's OCRmyPDF 17.12 shows no such warning with 10.08. If a newer OCRmyPDF starts warning again, check its release notes.) Get the GPL Ghostscript source tarball (`ghostscript-X.Y.Z.tar.gz`, not the `ghostpdl` or binary packages) from https://github.com/ArtifexSoftware/ghostpdl-downloads/releases. It bundles its own zlib, libpng, libjpeg, lcms2, freetype, openjpeg and jbig2dec, so it only needs a compiler:
 
 ```bash
 sudo dnf install gcc make            # once, if not already installed
 
 cd /tmp
-curl -LO https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10051/ghostscript-10.05.1.tar.gz
-tar xzf ghostscript-10.05.1.tar.gz && cd ghostscript-10.05.1
+curl -LO <tarball URL from the releases page>
+tar xzf ghostscript-X.Y.Z.tar.gz && cd ghostscript-X.Y.Z
 ./configure --prefix=/var/www/rails/pdfa-converter/vendor/ghostscript \
   --without-x --disable-cups --disable-gtk --disable-dbus --without-tesseract
 make -j"$(nproc)" && make install
 
-/var/www/rails/pdfa-converter/vendor/ghostscript/bin/gs --version   # 10.05.1
+/var/www/rails/pdfa-converter/vendor/ghostscript/bin/gs --version
 cd /var/www/rails/pdfa-converter && touch tmp/restart.txt
 ```
 

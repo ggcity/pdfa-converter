@@ -252,26 +252,56 @@ def stderr_exception_block(lines)
   i ? lines[i..] : []
 end
 
+# Absolute paths (job folders, /data in the verapdf container) shortened to
+# the file name. URLs are left alone.
+def strip_paths(line)
+  line.gsub(%r{(?<![\w.:/])/(?:[^\s/()]+/)+([^\s/()]+)}) { Regexp.last_match(1) }
+end
+
+# Runs of lines that differ only in numbers (e.g. 60 "treating bad indirect
+# reference" warnings for different objects, or "N skipping all processing on
+# this page") become one line with a count.
+def collapse_repeats(lines)
+  runs = []
+  lines.each do |l|
+    key = l.gsub(/\d+/, "#")
+    if runs.any? && runs.last[:key] == key
+      runs.last[:n] += 1
+    else
+      runs << { line: l, key: key, n: 1 }
+    end
+  end
+  runs.map { |r| r[:n] > 1 ? "#{r[:line]} (x#{r[:n]} similar lines)" : r[:line] }
+end
+
 # What the web page shows, verbatim: ocrmypdf's error block when there is one,
 # otherwise its warning/error lines (e.g. exit 10 has no exception), otherwise
 # the last few lines.
 def stderr_highlights(stderr, max_lines: 20)
-  lines  = stderr.to_s.lines.map(&:rstrip)
+  lines = stderr.to_s.lines.map { |l| strip_paths(l.rstrip) }
   picked = stderr_exception_block(lines)
-  picked = lines.reject(&:empty?).select { |l| l.match?(STDERR_DIAG_RE) } if picked.empty?
-  picked = lines.reject(&:empty?).last(3) if picked.empty?
-  picked.first(max_lines).join("\n").gsub(/\n{3,}/, "\n\n").strip
+  if picked.empty?
+    nonempty = lines.reject(&:empty?)
+    picked = nonempty.select { |l| l.match?(STDERR_DIAG_RE) }
+    picked << nonempty.last if nonempty.any? && picked.last != nonempty.last   # ocrmypdf's final verdict
+    picked = nonempty.last(3) if picked.empty?
+  end
+  collapse_repeats(picked).last(max_lines).join("\n").gsub(/\n{3,}/, "\n\n").strip
 end
 
 # For app.log: warning lines from before the error, then the whole error block
 # (or the last few lines when there is no error block).
 def stderr_digest(stderr, max_lines: 30)
-  lines  = stderr.to_s.lines.map(&:rstrip)
+  lines  = stderr.to_s.lines.map { |l| strip_paths(l.rstrip) }
   block  = stderr_exception_block(lines)
   before = lines[0, lines.length - block.length].reject(&:empty?)
-  picked = before.select { |l| l.match?(STDERR_DIAG_RE) }.uniq
-  picked += block.empty? ? before.last(5) : block.reject(&:empty?)
-  picked = picked.uniq if block.empty?
+  picked = before.select { |l| l.match?(STDERR_DIAG_RE) }
+  if block.empty?
+    picked << before.last if before.any? && picked.last != before.last   # ocrmypdf's final line
+  else
+    picked += block.reject(&:empty?)
+  end
+  picked = collapse_repeats(picked).uniq
   return "    | (no output)" if picked.empty?
   picked.last(max_lines).map { |l| "    | #{redact_job_ids(l)}" }.join("\n")
 end
@@ -302,10 +332,11 @@ def verapdf_label(result)
     return case verapdf_availability
            when :no_podman     then "skipped (podman not installed)"
            when :image_missing then "skipped (#{VERAPDF_IMAGE} image not pulled)"
-           else "no result (see the verapdf warning above)"
+           else "no result"
            end
   end
   return "pass (PDF/A-#{result["profile"]})" if result["result"] == "pass"
+  return "no verdict: #{result["details"]}" if result["result"] == "error"
   "fail: #{result["details"]}"
 end
 
@@ -354,10 +385,49 @@ PLAIN_DOCINFO_PY = <<~'PY'
   print("\n".join(changed))
 PY
 
+# ocrmypdf exit 4: it wrote a PDF that fails its own integrity check. Seen with
+# signed, fillable forms: Ghostscript drops the form but leaves the field
+# widgets pointing at object 0 ("treating bad indirect reference (0 0 R)").
+# This writes a copy with form fields and other annotations flattened into the
+# page content (they look the same but are no longer fillable) and the form,
+# including any signature field, removed.
+EXIT_INVALID_OUTPUT = 4
+
+FLATTEN_FORMS_PY = <<~'PY'
+  import sys, pikepdf
+  src, dst = sys.argv[1], sys.argv[2]
+  with pikepdf.open(src) as pdf:
+      had_form = "/AcroForm" in pdf.Root
+      before = sum(len(p.obj.get("/Annots", [])) for p in pdf.pages)
+      if not had_form and before == 0:
+          sys.exit(0)                          # nothing to flatten: write nothing
+      if had_form:
+          pdf.generate_appearance_streams()    # fields without an appearance would vanish
+      pdf.flatten_annotations("all")
+      if "/AcroForm" in pdf.Root:
+          del pdf.Root["/AcroForm"]
+      after = sum(len(p.obj.get("/Annots", [])) for p in pdf.pages)
+      pdf.save(dst)
+  print(f"form {'removed' if had_form else 'none'}, annotations {before} -> {after}")
+PY
+
+# Returns [path_of_flattened_copy_or_nil, "description"].
+def flatten_forms_copy(input_path, work_dir)
+  FileUtils.mkdir_p(work_dir)
+  dst = File.join(work_dir, "flattened-#{File.basename(input_path)}")
+  out, err, st = Open3.capture3(OCRMYPDF_PYTHON, "-c", FLATTEN_FORMS_PY, input_path, dst)
+  out, err = utf8(out), utf8(err)
+  return [nil, "could not flatten: #{(err.strip.lines.last || "exit #{st.exitstatus}").strip}"] unless st.success?
+  return [nil, "no form fields or annotations to flatten"] unless File.exist?(dst)
+  [dst, out.strip]
+rescue SystemCallError => e
+  [nil, "could not run #{OCRMYPDF_PYTHON}: #{e.message}"]
+end
+
 # Returns [path_of_plain_copy_or_nil, "description of changes"].
 def plain_docinfo_copy(input_path, work_dir)
   FileUtils.mkdir_p(work_dir)
-  dst = File.join(work_dir, File.basename(input_path))
+  dst = File.join(work_dir, "plain-#{File.basename(input_path)}")
   out, err, st = Open3.capture3(OCRMYPDF_PYTHON, "-c", PLAIN_DOCINFO_PY, input_path, dst)
   out, err = utf8(out), utf8(err)
   return [nil, "could not rewrite metadata: #{(err.strip.lines.last || "exit #{st.exitstatus}").strip}"] unless st.success?
@@ -456,7 +526,7 @@ def ghostscript_diagnostics(input_path, work_dir, log_path, level:, force:, extr
   lines = err.lines.map(&:rstrip).reject(&:empty?)
   lines.reject { |l| l.match?(DIAG_NOISE_RE) }
        .select { |l| l.match?(GS_DIAG_RE) }
-       .map { |l| redact_job_ids(l) }.uniq.last(40)
+       .map { |l| redact_job_ids(strip_paths(l)) }.uniq.last(40)
 rescue SystemCallError => e
   ["could not run the diagnostic pass: #{e.message}"]
 ensure
@@ -464,10 +534,24 @@ ensure
 end
 
 
+# podman's cgroup warnings when the app user has no systemd session (harmless).
+def without_podman_noise(text)
+  text.to_s.lines.reject { |l| l.start_with?("time=") && l.include?("level=warning") }.join
+end
+
+# The root cause of a verapdf crash: the last "Caused by:" line of its Java trace.
+def verapdf_error_reason(stderr)
+  lines  = without_podman_noise(stderr).lines.map(&:strip).reject(&:empty?)
+  caused = lines.reverse.find { |l| l.start_with?("Caused by:") }
+  return caused.sub("Caused by:", "").strip if caused
+  lines.find { |l| l.match?(/Exception|Error/) }
+end
+
 # Run verapdf to verify PDF/A conformance.
 # Returns { "result" => "pass", "profile" => "1b" },
 #         { "result" => "fail", "details" => "..." },
-#      or nil when verapdf is unavailable or produced no verdict (logged).
+#         { "result" => "error", "details" => "..." } when verapdf ran but gave no verdict (logged),
+#      or nil when verapdf is unavailable.
 def run_verapdf(pdf_path, log_path, tag: nil)
   return nil unless verapdf_availability == :available
 
@@ -489,13 +573,16 @@ def run_verapdf(pdf_path, log_path, tag: nil)
   first_line = stdout.lines.first.to_s.strip
   if first_line.start_with?("PASS")
     { "result" => "pass", "profile" => first_line.split[2] }   # e.g. "1b"
-  elsif first_line.empty?
-    # verapdf is installed but gave no verdict: an error, not "not installed"
-    LOGGER.warn "#{tag || filename}: verapdf ran but gave no result (podman exit #{status.exitstatus}); it said:\n" \
-                "#{stderr_digest(stderr)}"
-    nil
-  else
+  elsif first_line.start_with?("FAIL")
     { "result" => "fail", "details" => first_line }
+  else
+    # No verdict: verapdf crashed (e.g. "ERROR ... PDF/A Validation", exit 9,
+    # a Java exception inside one of its rules) or printed nothing. That is
+    # "could not check", not a failed check.
+    reason = verapdf_error_reason(stderr) || (first_line.empty? ? "no output" : first_line)
+    LOGGER.warn "#{tag || filename}: verapdf gave no verdict (exit #{status.exitstatus}): #{reason}\n" \
+                "#{stderr_digest(without_podman_noise(stderr))}"
+    { "result" => "error", "details" => "verapdf error (exit #{status.exitstatus}): #{reason}" }
   end
 rescue SystemCallError => e
   LOGGER.warn "#{tag || File.basename(pdf_path)}: could not run verapdf: #{e.class}: #{e.message}"
@@ -569,10 +656,26 @@ def process_job(job_id)
       exit_code, stderr = run_ocrmypdf(input_path, output_path, log_path, level: level, extra: extra_flags)
     end
 
-    # Retry 1 (automatic, content untouched): plain-ASCII document info
+    # Retry 1 (automatic): invalid output (exit 4), e.g. a form Ghostscript
+    # couldn't carry over. Flatten fields/annotations into the page and rerun.
+    form_flattened = false
+    if exit_code == EXIT_INVALID_OUTPUT
+      LOGGER.warn "#{tag}: conversion ended #{exit_label(exit_code)}; ocrmypdf said:\n#{stderr_digest(stderr)}"
+      flat_path, note = flatten_forms_copy(retry_input, File.join(job_dir(job_id), "work"))
+      if flat_path
+        LOGGER.info "#{tag}: retrying with form fields and annotations flattened into the page (#{note})"
+        exit_code, stderr = run_ocrmypdf(flat_path, output_path, log_path, level: level, extra: extra_flags)
+        form_flattened = true
+        retry_input    = flat_path
+      else
+        LOGGER.info "#{tag}: no flatten retry (#{note})"
+      end
+    end
+
+    # Retry 2 (automatic, content untouched): plain-ASCII document info
     if exit_code == EXIT_PDFA_FAILED
       LOGGER.warn "#{tag}: normal conversion ended #{exit_label(exit_code)}; ocrmypdf said:\n#{stderr_digest(stderr)}"
-      plain_path, note = plain_docinfo_copy(input_path, File.join(job_dir(job_id), "work"))
+      plain_path, note = plain_docinfo_copy(retry_input, File.join(job_dir(job_id), "work"))
       if plain_path
         LOGGER.info "#{tag}: retrying with plain-ASCII document info:\n#{note.lines.map { |l| "    | #{l.rstrip}" }.join("\n")}"
         exit_code, stderr = run_ocrmypdf(plain_path, output_path, log_path, level: level, extra: extra_flags)
@@ -586,7 +689,7 @@ def process_job(job_id)
       end
     end
 
-    # Retry 2 (last resort, only when the user opted in): pages as images
+    # Retry 3 (last resort, only when the user opted in): pages as images
     if exit_code == EXIT_PDFA_FAILED && initial["force_image"]
       LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{(ocrmypdf_flags(level, force: true) + extra_flags).join(" ")}"
       exit_code, stderr = run_ocrmypdf(retry_input, output_path, log_path, level: level, force: true, extra: extra_flags)
@@ -605,6 +708,7 @@ def process_job(job_id)
       entry["forced_image"]    = forced
       entry["docinfo_simplified"] = !docinfo_changes.nil?
       entry["signature_invalidated"] = !extra_flags.empty?
+      entry["form_flattened"]        = form_flattened
       entry["pdfa_validation"] = run_verapdf(output_path, log_path, tag: tag)
       data["completed_files"] += 1
       how = if forced then "forced as page images"
@@ -612,6 +716,7 @@ def process_job(job_id)
             else "normal"
             end
       how += ", digital signature invalidated" unless extra_flags.empty?
+      how += ", form fields flattened" if form_flattened
       LOGGER.info "#{tag}: converted in #{elapsed}s (#{how}, exit #{exit_label(exit_code)}), " \
                   "output #{describe_pdf(output_path)}, verapdf post-check #{verapdf_label(entry["pdfa_validation"])}"
     else
@@ -620,6 +725,7 @@ def process_job(job_id)
       entry["exit_code"]    = exit_code
       entry["exit_name"]    = OCRMYPDF_EXIT_NAMES.fetch(exit_code, "unknown")
       entry["signature_invalidated"] = !extra_flags.empty?
+      entry["form_flattened"]        = form_flattened
       entry["forced_image"] = forced
       entry["docinfo_simplified"] = !docinfo_changes.nil?
       data["completed_files"] += 1
