@@ -341,8 +341,9 @@ def verapdf_label(result)
 end
 
 # "Force archival" retry: rasterize every page and OCR it instead of keeping the
-# existing text layer. Only used, when the user opts in, for files whose normal
-# conversion ends in EXIT_PDFA_FAILED. (--force-ocr and --skip-text are exclusive.)
+# existing text layer. Only used, when the user opts in, for files that still
+# end in FORCE_RETRY_EXITS after the automatic retries. (--force-ocr and
+# --skip-text are exclusive.)
 OCRMYPDF_FORCE_FLAGS = OCRMYPDF_FLAGS.map { |f| f == "--skip-text" ? "--force-ocr" : f }.freeze
 EXIT_PDFA_FAILED     = 10   # output is a valid PDF, but not PDF/A
 
@@ -392,6 +393,10 @@ PY
 # page content (they look the same but are no longer fillable) and the form,
 # including any signature field, removed.
 EXIT_INVALID_OUTPUT = 4
+
+# Failures where ocrmypdf ran to the end but couldn't produce a valid PDF/A.
+# These get the opt-in page-image retry and the Ghostscript diagnostics.
+FORCE_RETRY_EXITS = [EXIT_PDFA_FAILED, EXIT_INVALID_OUTPUT].freeze
 
 FLATTEN_FORMS_PY = <<~'PY'
   import sys, pikepdf
@@ -690,7 +695,7 @@ def process_job(job_id)
     end
 
     # Retry 3 (last resort, only when the user opted in): pages as images
-    if exit_code == EXIT_PDFA_FAILED && initial["force_image"]
+    if FORCE_RETRY_EXITS.include?(exit_code) && initial["force_image"]
       LOGGER.info "#{tag}: force archival is on, retrying as page images: ocrmypdf #{(ocrmypdf_flags(level, force: true) + extra_flags).join(" ")}"
       exit_code, stderr = run_ocrmypdf(retry_input, output_path, log_path, level: level, force: true, extra: extra_flags)
       forced = true
@@ -733,14 +738,15 @@ def process_job(job_id)
       FileUtils.rm_f(output_path)   # a non-archival leftover must not end up in the download
       context = if forced
         "even after the forced page-image retry"
-      elsif exit_code == EXIT_PDFA_FAILED
-        "#{docinfo_changes ? "also after the plain-document-info retry; " : ""}force archival was off, so no page-image retry"
+      elsif FORCE_RETRY_EXITS.include?(exit_code)
+        tried = [("flattened form" if form_flattened), ("plain document info" if docinfo_changes)].compact
+        "#{tried.any? ? "also after the #{tried.join(" and ")} retry; " : ""}force archival was off, so no page-image retry"
       else
         "no retry for this exit code"
       end
       LOGGER.warn "#{tag}: FAILED in #{elapsed}s, exit #{exit_label(exit_code)} (#{context}); ocrmypdf said:\n" \
                   "#{stderr_digest(stderr)}\n    #{job_log_hint(job_id, filename)}"
-      if exit_code == EXIT_PDFA_FAILED
+      if FORCE_RETRY_EXITS.include?(exit_code)
         gs_lines = ghostscript_diagnostics(retry_input, File.join(job_dir(job_id), "work"), log_path, level: level,
                                            force: forced, extra: extra_flags)
         body = gs_lines.empty? ? "    | (no Ghostscript messages)" : gs_lines.map { |l| "    | #{l}" }.join("\n")
